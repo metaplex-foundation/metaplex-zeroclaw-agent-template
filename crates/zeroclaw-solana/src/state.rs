@@ -8,8 +8,10 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentState {
+    /// Base58-encoded Pubkey. Callers parse with `solana_sdk::pubkey::Pubkey::from_str`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_asset_address: Option<String>,
+    /// Base58-encoded Pubkey. Callers parse with `solana_sdk::pubkey::Pubkey::from_str`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_token_mint: Option<String>,
 }
@@ -23,7 +25,8 @@ pub fn load_at(path: &Path) -> Result<AgentState> {
     }
 }
 
-/// Atomic write: tmp + fsync + rename. Sets mode 0600 on unix.
+/// Atomic write: tmp + fsync + rename + best-effort parent-dir fsync. Sets
+/// mode 0600 on unix.
 ///
 /// Concurrency: `save_at` is **not** safe for concurrent callers on the same
 /// path — two writers racing can both create the `.tmp` sidecar and both
@@ -32,7 +35,16 @@ pub fn load_at(path: &Path) -> Result<AgentState> {
 ///
 /// Crash safety: the rename is atomic on POSIX filesystems, so an interrupt
 /// between `.tmp` creation and `rename` leaves the original `agent-state.json`
-/// intact (only a stray `.tmp` sidecar may remain).
+/// intact (only a stray `.tmp` sidecar may remain). After `rename` returns we
+/// make a best-effort attempt to `fsync` the parent directory so the new
+/// directory entry is durable; this is best-effort because some filesystems
+/// (notably tmpfs and certain NFS mounts) reject `fsync` on directory
+/// handles, in which case an interrupt *after* `rename` returned may still
+/// leave the directory entry un-flushed even though the file contents are
+/// durable.
+///
+/// On non-unix targets, `save_at` writes without fsync and without
+/// permission restriction; ZeroClaw server deployment is unix-only.
 pub fn save_at(path: &Path, state: &AgentState) -> Result<()> {
     let tmp = path.with_extension("json.tmp");
     let json = serde_json::to_vec_pretty(state)?;
@@ -57,6 +69,13 @@ pub fn save_at(path: &Path, state: &AgentState) -> Result<()> {
     }
     std::fs::rename(&tmp, path)
         .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        // Best-effort — tmpfs and some NFS mounts reject fsync on directory handles.
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
     Ok(())
 }
 
@@ -72,7 +91,10 @@ pub fn workspace_state_path_from(start: &Path) -> Result<PathBuf> {
         let candidate = cur.join("Cargo.toml");
         if candidate.exists() {
             let content = std::fs::read_to_string(&candidate).unwrap_or_default();
-            if content.contains("[workspace]") {
+            if content
+                .lines()
+                .any(|l| l.trim_start().starts_with("[workspace]"))
+            {
                 return Ok(cur.join("agent-state.json"));
             }
         }
@@ -98,7 +120,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn round_trips_empty_state() {
+    fn load_missing_returns_default() {
         let d = tempdir().unwrap();
         let path = d.path().join("agent-state.json");
         let loaded = load_at(&path).unwrap();
@@ -178,6 +200,24 @@ mod tests {
                 got.parent().unwrap().canonicalize().unwrap(),
                 root.canonicalize().unwrap()
             );
+        }
+    }
+
+    #[test]
+    fn workspace_state_path_from_ignores_comment_false_positives() {
+        let d = tempdir().unwrap();
+        let fake_root = d.path();
+        std::fs::write(
+            fake_root.join("Cargo.toml"),
+            "# this used to be a [workspace] member\n[package]\nname = \"foo\"\n",
+        )
+        .unwrap();
+        let result = workspace_state_path_from(fake_root);
+        // This should NOT resolve anchored at fake_root; it should either
+        // walk further up (if there's a real workspace ancestor) or error.
+        // Assert that if it returns Ok, the parent is NOT fake_root.
+        if let Ok(p) = result {
+            assert_ne!(p.parent().unwrap(), fake_root);
         }
     }
 
