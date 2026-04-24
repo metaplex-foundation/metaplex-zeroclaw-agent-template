@@ -10,6 +10,7 @@
 //! crate map.
 
 pub mod client;
+pub mod context;
 pub mod error_codes;
 pub mod keypair;
 pub mod state;
