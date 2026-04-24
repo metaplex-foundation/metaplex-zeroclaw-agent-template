@@ -13,5 +13,6 @@ pub mod client;
 pub mod context;
 pub mod error_codes;
 pub mod keypair;
+pub mod owner;
 pub mod state;
 pub mod tool_result;
