@@ -4,6 +4,13 @@
 use anyhow::{Context, Result, anyhow};
 use solana_sdk::signature::Keypair;
 
+/// Decode an `AGENT_KEYPAIR` value. Accepts two formats (SPEC §8.1):
+///
+/// 1. Base58-encoded 64-byte secret key.
+/// 2. JSON byte array `[1, 2, ...]` of length 64.
+///
+/// Leading/trailing whitespace is stripped; whitespace inside the JSON
+/// array is handled by `serde_json` as usual.
 pub fn decode(raw: &str) -> Result<Keypair> {
     let trimmed = raw.trim();
     if trimmed.starts_with('[') {
@@ -106,5 +113,35 @@ mod tests {
         let err = decode("[1, 2, \"three\"]").unwrap_err();
         let msg = err.to_string().to_lowercase();
         assert!(msg.contains("json") || msg.contains("expected"));
+    }
+
+    #[test]
+    fn rejects_empty_input() {
+        let err = decode("").unwrap_err();
+        assert!(err.to_string().contains("AGENT_KEYPAIR"));
+    }
+
+    #[test]
+    fn rejects_whitespace_only_input() {
+        let err = decode("   \n\t  ").unwrap_err();
+        assert!(err.to_string().contains("AGENT_KEYPAIR"));
+    }
+
+    #[test]
+    fn rejects_valid_length_invalid_ed25519() {
+        // 64 zero bytes: length check passes, but Ed25519 validation fails
+        // because the second 32 bytes (public key half) don't match the
+        // seed (first 32 bytes).
+        let encoded = bs58::encode([0u8; 64]).into_string();
+        let err = decode(&encoded).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("AGENT_KEYPAIR"),
+            "error must be prefixed with AGENT_KEYPAIR, got: {msg}"
+        );
+        assert!(
+            !msg.contains("length"),
+            "this must come from the Ed25519 validator, not our length check, got: {msg}"
+        );
     }
 }
