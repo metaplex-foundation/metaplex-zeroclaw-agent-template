@@ -38,6 +38,7 @@ pub trait TxSender: Send + Sync {
 
 /// Errors from `TxSender::send_and_await` — already sanitized for the LLM.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum TxSendError {
     #[error("user rejected or wallet error: {0}")]
     Rejected(String),
@@ -94,6 +95,17 @@ impl std::fmt::Debug for AgentContext {
             )
             .finish()
     }
+}
+
+#[cfg(test)]
+mod _assert_send_sync {
+    use super::*;
+    const _: fn() = || {
+        fn is_send_sync<T: Send + Sync>() {}
+        is_send_sync::<AgentContext>();
+        is_send_sync::<TxSendOpts>();
+        is_send_sync::<TxSendError>();
+    };
 }
 
 #[cfg(test)]
