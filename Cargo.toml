@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/zeroclaw-api", "crates/zeroclaw-infra", "crates/zeroclaw-config", "crates/zeroclaw-providers", "crates/zeroclaw-memory", "crates/zeroclaw-channels", "crates/zeroclaw-tools", "crates/zeroclaw-runtime", "crates/zeroclaw-tui", "crates/zeroclaw-plugins", "crates/zeroclaw-gateway", "crates/zeroclaw-hardware", "crates/zeroclaw-tool-call-parser", "crates/robot-kit", "crates/aardvark-sys", "crates/zeroclaw-macros", "apps/tauri"]
+members = [".", "crates/zeroclaw-api", "crates/zeroclaw-infra", "crates/zeroclaw-config", "crates/zeroclaw-providers", "crates/zeroclaw-memory", "crates/zeroclaw-channels", "crates/zeroclaw-tools", "crates/zeroclaw-runtime", "crates/zeroclaw-solana", "crates/zeroclaw-tui", "crates/zeroclaw-plugins", "crates/zeroclaw-gateway", "crates/zeroclaw-hardware", "crates/zeroclaw-tool-call-parser", "crates/robot-kit", "crates/aardvark-sys", "crates/zeroclaw-macros", "apps/tauri"]
 resolver = "2"
 
 [workspace.package]
@@ -18,6 +18,7 @@ zeroclaw-memory = { path = "crates/zeroclaw-memory", version = "0.7.3" }
 zeroclaw-channels = { path = "crates/zeroclaw-channels", version = "0.7.3", default-features = false }
 zeroclaw-tools = { path = "crates/zeroclaw-tools", version = "0.7.3" }
 zeroclaw-runtime = { path = "crates/zeroclaw-runtime", version = "0.7.3", default-features = false }
+zeroclaw-solana = { path = "crates/zeroclaw-solana", version = "0.7.3" }
 zeroclaw-tui = { path = "crates/zeroclaw-tui", version = "0.7.3" }
 zeroclaw-plugins = { path = "crates/zeroclaw-plugins", version = "0.7.3" }
 zeroclaw-gateway = { path = "crates/zeroclaw-gateway", version = "0.7.3" }
@@ -25,6 +26,13 @@ zeroclaw-hardware = { path = "crates/zeroclaw-hardware", version = "0.7.3" }
 zeroclaw-tool-call-parser = { path = "crates/zeroclaw-tool-call-parser", version = "0.7.3" }
 zeroclaw-macros = { path = "crates/zeroclaw-macros", version = "0.7.3" }
 aardvark-sys = { path = "crates/aardvark-sys", version = "0.1.0" }
+solana-sdk = { version = "3", default-features = false }
+solana-client = { version = "3", default-features = false }
+solana-transaction-status = { version = "3", default-features = false }
+spl-token = { version = "9", default-features = false, features = ["no-entrypoint"] }
+spl-associated-token-account = { version = "8", default-features = false, features = ["no-entrypoint"] }
+mpl-core = { version = "0.12", default-features = false, features = ["borsh-v1"] }
+bs58 = { version = "0.5", default-features = false, features = ["alloc"] }
 
 [package]
 name = "zeroclawlabs"
