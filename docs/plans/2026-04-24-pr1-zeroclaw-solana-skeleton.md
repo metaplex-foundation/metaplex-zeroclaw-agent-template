@@ -1213,3 +1213,13 @@ Chose the `3.x` line for the three Anza/Solana crates (`solana-sdk`, `solana-cli
 `spl-token`, `spl-associated-token-account`, and `solana-transaction-status` are declared in `[workspace.dependencies]` for future consumers but are **not** pulled by `zeroclaw-solana` itself yet (per the Task 1 crate manifest). They'll be activated by later PRs when those modules land. Their versions above are the best-guess latest majors; revisit on first use.
 
 `cargo check -p zeroclaw-solana` and `cargo check --workspace` both pass on `rustc 1.95` with these pins.
+
+### Task 4 (2026-04-24) — solana-sdk 3.x API drift
+
+The Task 4 plan snippet called `Keypair::from_bytes(&bytes)`, which does not exist in `solana-sdk 3.x`. In the 3.x line, `solana_keypair::Keypair` (re-exported as `solana_sdk::signature::Keypair` behind the `full` feature) now implements `TryFrom<&[u8]>` instead, returning `Result<Keypair, SignatureError>`. Adjusted the decoder and tests to use `Keypair::try_from(&bytes[..])`. Length validation stays explicit (`bytes.len() != 64`) so we return the plan's intended "length N, expected 64" message rather than the library's generic "candidate keypair byte array is the wrong length".
+
+Had to add `features = ["full"]` to the `solana-sdk` dep in `crates/zeroclaw-solana/Cargo.toml`. The workspace declares `solana-sdk = { version = "3", default-features = false }`, and in 3.x the entire `signature` / `signer` modules (including `Keypair`, `Signer`, `SignerError`) are gated on `#[cfg(feature = "full")]`. Without `full`, `solana_sdk::signature::Keypair` doesn't resolve. Enabling `full` only on this crate keeps the workspace default minimal for other future consumers while giving `zeroclaw-solana` the signer surface SPEC §8.1 requires.
+
+Used `Keypair::new()` in the tests to generate fresh bytes at test time (the deviation from the plan's SAMPLE_SECRET_BS58 approach, explicitly allowed by Task 4 self-review). Avoids any hardcoded-secret lint traps and keeps the test self-contained.
+
+`cargo test -p zeroclaw-solana` → 25 passed (18 existing + 7 new). `cargo clippy -p zeroclaw-solana --all-targets -- -D warnings` and `cargo fmt --all -- --check` both exit 0. The `pub use solana_sdk::signature::{Keypair as SolanaKeypair, Signer as SolanaSigner};` re-export compiled without stutter warnings under `-D warnings`.

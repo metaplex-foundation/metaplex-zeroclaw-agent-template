@@ -10,4 +10,5 @@
 //! crate map.
 
 pub mod error_codes;
+pub mod keypair;
 pub mod tool_result;

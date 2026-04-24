@@ -16,7 +16,7 @@ parking_lot = "0.12"
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 solana-client.workspace = true
-solana-sdk.workspace = true
+solana-sdk = { workspace = true, features = ["full"] }
 thiserror = "2.0"
 tokio = { version = "1.50", default-features = false, features = ["sync", "time", "rt", "fs"] }
 tracing = { version = "0.1", default-features = false }
