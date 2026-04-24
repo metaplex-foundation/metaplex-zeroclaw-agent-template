@@ -19,7 +19,7 @@ pub enum ToolErrorCode {
 }
 
 /// A classified tool error ready to return to the LLM.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolError {
     pub code: ToolErrorCode,
     pub message: String,
@@ -32,6 +32,11 @@ const MAX_MESSAGE_BYTES: usize = 200;
 /// Classify an `anyhow::Error` (or `&dyn std::error::Error`) into a
 /// `ToolError`. The raw error should be logged separately — only the
 /// classified code + LLM-safe message should reach the model.
+///
+/// Keywords are checked in a fixed order; the first match wins. For example,
+/// `"insufficient funds, account not found"` classifies as
+/// `InsufficientFunds`, not `NotFound`, because `insufficient` is checked
+/// before `not found`.
 pub fn to_tool_error(err: &anyhow::Error) -> ToolError {
     let raw = err.to_string();
     let lc = raw.to_ascii_lowercase();
@@ -132,6 +137,25 @@ mod tests {
         let err = to_tool_error(&anyhow::anyhow!("{long}"));
         assert_eq!(err.code, ToolErrorCode::Generic);
         assert!(err.message.len() <= 200);
+    }
+
+    #[test]
+    fn overlap_first_match_wins() {
+        // "insufficient" beats "not found"
+        assert_eq!(
+            to_tool_error(&anyhow::anyhow!("insufficient funds; account not found")).code,
+            ToolErrorCode::InsufficientFunds
+        );
+        // "timed out" beats "rpc"
+        assert_eq!(
+            to_tool_error(&anyhow::anyhow!("rpc request timed out")).code,
+            ToolErrorCode::Timeout
+        );
+        // "slippage" beats "price impact" (both possible in one message)
+        assert_eq!(
+            to_tool_error(&anyhow::anyhow!("slippage from price impact too high")).code,
+            ToolErrorCode::SlippageTooHigh
+        );
     }
 
     #[test]
