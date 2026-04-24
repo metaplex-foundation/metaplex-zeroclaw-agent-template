@@ -11,4 +11,5 @@
 
 pub mod error_codes;
 pub mod keypair;
+pub mod state;
 pub mod tool_result;
