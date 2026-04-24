@@ -1,3 +1,9 @@
+//! Discriminated tool-result type + bridge to `zeroclaw_api::tool::ToolResult`.
+//!
+//! Tools return `ToolResult<T>` with a `status` discriminant (`success`, `info`,
+//! `error`). The `Into<api::ToolResult>` bridge serializes the typed variant to
+//! JSON and sets the envelope flags for the gateway. Mirrors SPEC §5.2 / §5.3.
+
 use crate::error_codes::ToolErrorCode;
 use serde::Serialize;
 
@@ -29,28 +35,36 @@ pub fn info<T: Serialize>(data: T) -> ToolResult<T> {
 }
 
 pub fn err<T: Serialize>(code: ToolErrorCode, message: impl Into<String>) -> ToolResult<T> {
+    let message = crate::error_codes::truncate_llm_message(message.into());
     ToolResult::Error {
         code,
-        message: message.into(),
+        message,
         _phantom: std::marker::PhantomData,
     }
 }
 
 impl<T: Serialize> From<ToolResult<T>> for zeroclaw_api::tool::ToolResult {
     fn from(r: ToolResult<T>) -> Self {
-        let (success, error) = match &r {
-            ToolResult::Error { message, .. } => (false, Some(message.clone())),
-            _ => (true, None),
-        };
-        let output = serde_json::to_string(&r).unwrap_or_else(|e| {
-            format!(
-                "{{\"status\":\"error\",\"code\":\"GENERIC\",\"message\":\"serde failure: {e}\"}}"
-            )
-        });
-        zeroclaw_api::tool::ToolResult {
-            success,
-            output,
-            error,
+        let serialized = serde_json::to_string(&r);
+        match (&r, serialized) {
+            (ToolResult::Error { message, .. }, Ok(output)) => zeroclaw_api::tool::ToolResult {
+                success: false,
+                output,
+                error: Some(message.clone()),
+            },
+            (_, Ok(output)) => zeroclaw_api::tool::ToolResult {
+                success: true,
+                output,
+                error: None,
+            },
+            (_, Err(e)) => {
+                let reason = format!("tool-result serialization failed: {e}");
+                zeroclaw_api::tool::ToolResult {
+                    success: false,
+                    output: "{\"status\":\"error\",\"code\":\"GENERIC\",\"message\":\"serialization failure\"}".to_string(),
+                    error: Some(reason),
+                }
+            }
         }
     }
 }
@@ -100,5 +114,45 @@ mod tests {
         let api: zeroclaw_api::tool::ToolResult = r.into();
         assert!(!api.success);
         assert_eq!(api.error.as_deref(), Some("delta mismatch"));
+    }
+
+    #[test]
+    fn bridges_to_api_tool_result_on_info() {
+        let r = info(serde_json::json!({ "note": "already registered" }));
+        let api: zeroclaw_api::tool::ToolResult = r.into();
+        assert!(api.success);
+        assert!(api.error.is_none());
+        assert!(api.output.contains("\"status\":\"info\""));
+    }
+
+    #[test]
+    fn bridges_serialization_failure_as_error() {
+        use serde::ser::Error;
+        use serde::{Serialize, Serializer};
+
+        struct AlwaysFails;
+        impl Serialize for AlwaysFails {
+            fn serialize<S: Serializer>(&self, _s: S) -> Result<S::Ok, S::Error> {
+                Err(S::Error::custom("intentional test failure"))
+            }
+        }
+
+        let r = ok(AlwaysFails);
+        let api: zeroclaw_api::tool::ToolResult = r.into();
+        assert!(
+            !api.success,
+            "failed serialization must not masquerade as success"
+        );
+        assert!(api.error.as_deref().unwrap_or("").contains("serialization"));
+        assert!(api.output.contains("\"status\":\"error\""));
+    }
+
+    #[test]
+    fn err_truncates_long_message_to_under_200_bytes() {
+        let long: String = "x".repeat(500);
+        let r: ToolResult<()> = err(ToolErrorCode::Generic, long);
+        let v = serde_json::to_value(&r).unwrap();
+        let msg = v["message"].as_str().unwrap();
+        assert!(msg.len() <= 200);
     }
 }

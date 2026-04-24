@@ -29,6 +29,22 @@ pub struct ToolError {
 /// nearest char boundary at or below this value.
 const MAX_MESSAGE_BYTES: usize = 200;
 
+/// Truncate an error/diagnostic string to `MAX_MESSAGE_BYTES` while
+/// respecting UTF-8 character boundaries. Used by both `to_tool_error`
+/// and `tool_result::err` to keep LLM-visible messages bounded
+/// (SPEC §5.3).
+pub fn truncate_llm_message(mut s: String) -> String {
+    if s.len() <= MAX_MESSAGE_BYTES {
+        return s;
+    }
+    let mut cut = MAX_MESSAGE_BYTES;
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    s.truncate(cut);
+    s
+}
+
 /// Classify an `anyhow::Error` (or `&dyn std::error::Error`) into a
 /// `ToolError`. The raw error should be logged separately — only the
 /// classified code + LLM-safe message should reach the model.
@@ -57,17 +73,7 @@ pub fn to_tool_error(err: &anyhow::Error) -> ToolError {
     } else {
         ToolErrorCode::Generic
     };
-    let mut message = raw;
-    if message.len() > MAX_MESSAGE_BYTES {
-        // `String::truncate` panics when the byte index lands inside a
-        // multi-byte UTF-8 character. Walk back to the nearest char
-        // boundary before truncating.
-        let mut cut = MAX_MESSAGE_BYTES;
-        while cut > 0 && !message.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        message.truncate(cut);
-    }
+    let message = truncate_llm_message(raw);
     ToolError { code, message }
 }
 
