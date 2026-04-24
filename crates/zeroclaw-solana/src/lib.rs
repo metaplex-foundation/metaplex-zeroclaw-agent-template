@@ -9,6 +9,7 @@
 //! See `docs/plans/2026-04-24-metaplex-agent-port-design.md` §1 for the full
 //! crate map.
 
+pub mod client;
 pub mod error_codes;
 pub mod keypair;
 pub mod state;

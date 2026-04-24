@@ -1223,3 +1223,15 @@ Had to add `features = ["full"]` to the `solana-sdk` dep in `crates/zeroclaw-sol
 Used `Keypair::new()` in the tests to generate fresh bytes at test time (the deviation from the plan's SAMPLE_SECRET_BS58 approach, explicitly allowed by Task 4 self-review). Avoids any hardcoded-secret lint traps and keeps the test self-contained.
 
 `cargo test -p zeroclaw-solana` → 25 passed (18 existing + 7 new). `cargo clippy -p zeroclaw-solana --all-targets -- -D warnings` and `cargo fmt --all -- --check` both exit 0. The `pub use solana_sdk::signature::{Keypair as SolanaKeypair, Signer as SolanaSigner};` re-export compiled without stutter warnings under `-D warnings`.
+
+### Task 7 (2026-04-24) — executed before Task 6; solana-commitment-config split-out crate
+
+Executed Task 7 ahead of Task 6 per the Task 6 Step 2 "alternative: reorder" note, so the `context` module can reference `SolanaClient` without a stub.
+
+The Task 7 plan snippet imported `solana_sdk::commitment_config::CommitmentConfig`. This path does not exist in `solana-sdk 3.x`. Unlike `Keypair` (which 3.x keeps re-exported under `solana_sdk::signature::Keypair` behind `full`), `CommitmentConfig` was extracted to its own `solana-commitment-config` crate and is NOT re-exported by `solana-sdk 3.0.0` at all — no feature flag brings it back. `solana-client 3.1.14` also does not re-export it (verified by inspecting `src/lib.rs` — only `rpc_client_api::*` modules are re-exported under named submodules).
+
+Options considered: (1) rely on the transitive `solana_commitment_config` crate without declaring it — rejected as fragile (breaks if upstream dep graph shifts); (2) add `solana-commitment-config` as a direct `zeroclaw-solana` dep — chosen. Pinned to `version = "3", default-features = false` matching the Anza-ecosystem 3.x line already locked by Task 1. Kept it crate-local rather than promoting to `[workspace.dependencies]` because no other crate needs it yet; promote on first second-consumer per the same rule Task 1 used for `spl-token`.
+
+`solana-client 3.1.14` resolved `nonblocking::rpc_client::RpcClient` without any feature flags — the "if you need features on solana-client" branch of Task 7 did not trigger.
+
+`cargo test -p zeroclaw-solana` → 37 passed (35 existing + 2 new). `cargo clippy -p zeroclaw-solana --all-targets -- -D warnings` and `cargo fmt --all -- --check` both exit 0. The unreachable-RPC test hits `http://127.0.0.1:1` and asserts the error message contains `preflight`, `get_slot`, or `connection`; observed error matches (anyhow context wrapping preserves "RPC preflight get_slot failed" prefix).

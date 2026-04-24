@@ -16330,6 +16330,7 @@ dependencies = [
  "serde",
  "serde_json",
  "solana-client",
+ "solana-commitment-config",
  "solana-sdk",
  "tempfile",
  "thiserror 2.0.18",
