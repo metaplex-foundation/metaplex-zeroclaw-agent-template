@@ -155,6 +155,58 @@
 - `squash-merge` skill added — preserves clean commit history when merging upstream
   changes (#5782).
 
+### Metaplex agent template port
+
+A Rust port of the Metaplex Agent Template (originally a TypeScript / Umi server) lands
+across six PRs. The port exposes the SPEC §6 PlexChat WebSocket protocol and the SPEC §5
+Solana / Metaplex tool surface so the existing Next.js test UI connects unchanged at
+`ws://<host>/ws/plexchat`.
+
+Shipped:
+
+- **Foundation crate `zeroclaw-solana`** — async `SolanaClient` wrapping
+  `solana_client::nonblocking::rpc_client::RpcClient`, `AGENT_KEYPAIR` decoder
+  (base58 + JSON byte array), atomic mode-`0600` `agent-state.json` IO anchored to the
+  workspace root, `AgentContext` matching SPEC Appendix B, error-code taxonomy,
+  discriminated `ToolResult<T>` bridge to `zeroclaw-api::ToolResult`, owner resolver +
+  TTL cache, mode-aware `submit_or_send` tx routing, `ensure_agent_funded` seam, and a
+  Jupiter HTTP client with `simulate_and_verify_swap` integrity check (PR 1, PR 4, PR 5).
+- **PlexChat WS protocol** — new `/ws/plexchat` route with three-way bearer auth,
+  `MAX_CONNECTIONS = 10` cap, sliding 20/10s rate limit, ping/pong aliveness with two-tick
+  pong-timeout teardown, complete `ClientMsg` / `ServerMsg` enum surface (SPEC §6.3 +
+  Appendix A), SPEC §6.6 late-ok `tx_result` handling, SPEC §6.5 safe-reason allow-listing,
+  and SPEC §6.2 prompt-injection mitigation by stripping `\r`, `\n`, `[`, `]` from inbound
+  user messages (PR 2).
+- **11 working tools** in `zeroclaw-tools/src/solana/{shared,public}/`:
+  `get-balance`, `get-token-balances`, `get-transaction`, `get-token-price`,
+  `get-token-metadata`, `sleep`, `transfer-sol`, `transfer-token`, `swap-token`,
+  `buyback-token`, `sell-token` (PRs 3 + 4 + 5).
+- **3 stub tools** with final registry surfaces, each refusing to execute until the
+  hand-rolled IDL clients land: `register-agent` and `delegate-execution` (require
+  `mpl-agent-registry`), `launch-token` (requires `mpl-genesis`, with the SPEC §10.5
+  `confirm_irreversible: bool` gate already enforced) — PRs 4 + 6.
+- **Auth wrapper** — `with_auth(tool, AuthLevel::{Public,Owner})` bridges SPEC §5.4 to
+  the `Tool` trait without changes to `zeroclaw-api`.
+- **AGENT_CTX plumbing** — the PlexChat handler scopes each inbound message via
+  `tokio::task_local!` `AGENT_CTX::scope`, giving every tool reachable from the future
+  agent loop a populated `AgentContext` via `current_context()` (PR 6).
+
+Deferred (PR 7+):
+
+- Real implementations of `register-agent`, `delegate-execution`, and `launch-token`
+  (each requires a hand-rolled IDL client; the upstream Rust crates are not on
+  crates.io as of this writing).
+- Full LLM-driven agent loop integration with `zeroclaw-runtime` — the scope wraps the
+  message dispatch but the dispatch still emits the PR 2 stub echo. Wiring the agent
+  loop requires deeper runtime integration that's out of scope for the port skeleton.
+- SPEC §6.5 `debug:*` event stream (`PlexChatDebugObserver`).
+- SPEC §6.7 per-message token / tool / RPC time budget enforcement.
+- Full SPEC §6.6 late-ok matrix beyond the initial `tx_result` path.
+- Full SPEC §3.4 owner-resolution invalidation hook on `register-agent` success.
+
+The port is a working tool surface and protocol skeleton, not a turn-key product. PR 7+
+extends it.
+
 ### Security
 
 - Dangerous interpreter arguments (e.g. `-e`, `--eval`, `-c` on interpreters) are now

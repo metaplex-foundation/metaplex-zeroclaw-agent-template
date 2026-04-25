@@ -133,3 +133,57 @@ Each PR validates with `./dev/ci.sh all`. PR 1 and 2 unblock UI protocol develop
 - **`mpl-agent-registry` / `mpl-genesis` Rust availability** — mitigated by IDL-client fallback; verified first step of PR 1 and PR 6.
 - **Jupiter response drift** — snapshot tests on a static quote JSON + schema validation; integrity check is the backstop.
 - **High-risk surfaces** — all PRs touch `crates/zeroclaw-runtime/src/**` (context/observer), `crates/zeroclaw-gateway/src/**` (WS), and new `zeroclaw-solana` (tx signing). Per AGENTS.md, full `./dev/ci.sh all` on every PR.
+
+## What landed (final summary, post-PR 6)
+
+The phased rollout above shipped across six landable PRs. This section summarises what
+actually landed against the original plan and what was deferred, so the post-port state
+of the codebase is recoverable without reading every commit.
+
+### Per-PR scope (final)
+
+| # | What landed | Tests added |
+|---|---|---|
+| 1 | `zeroclaw-solana` skeleton: `client`, `keypair`, `state`, `context` (with `AGENT_CTX` task-local + `current_context`), `error_codes`, `tool_result`, `owner` (TTL cache), `auth`, `funding` seam, `submit_or_send` mode-aware routing | 79 unit tests in `zeroclaw-solana` |
+| 2 | PlexChat WS route at `/ws/plexchat`: three-way bearer auth, `MAX_CONNECTIONS = 10`, sliding 20/10s rate limit, ping/pong aliveness, full `ClientMsg`/`ServerMsg` wire enums, late-ok `tx_result`, safe-reason sanitizer, `[…]`/CR/LF prompt-injection strip | 50 ws_plexchat tests |
+| 3 | Read-only tool subset: `get-balance`, `get-token-balances`, `get-transaction`, `get-token-price`, `get-token-metadata`, `sleep`. `with_auth` wrapper bridging `AuthLevel::{Public,Owner}` to the `Tool` trait | per-tool unit tests |
+| 4 | Mode-aware tx routing live: `submit_or_send` + `ensure_agent_funded`, public-mode `transfer-sol` + `transfer-token`, owner-only `register-agent` + `delegate-execution` stubs (NOT_IMPLEMENTED, gated on hand-rolled `mpl-agent-registry` IDL client) | per-tool unit tests + funding round-trip |
+| 5 | Jupiter HTTP client: `quote`, `swap`, `simulate_and_verify_swap` integrity check (SPEC §10.4). `swap-token`, `buyback-token`, `sell-token` (agent-signed). `agent_keypair` extension on `AgentContext` | per-tool unit tests + simulator delta checks |
+| 6 | `launch-token` stub (NOT_IMPLEMENTED, `confirm_irreversible: bool` enforced; gated on hand-rolled `mpl-genesis` IDL client). `AGENT_CTX::scope` wraps `dispatch_client_msg` so every inbound message gives downstream tools a populated context. `PlexChatTxSender` constructor + `ServerMsg` forwarder task. CHANGELOG + design doc updates. | scope acceptance test (`agent_ctx_scope_wraps_tool_execute`), build_agent_context mode-specific tests, agent_mode_from_config tests, launch-token gate tests |
+
+### Deferred (PR 7+)
+
+The port is a working tool surface and protocol skeleton, not a turn-key product. The
+following items in the original plan are explicitly deferred:
+
+- **Real `register-agent`, `delegate-execution`, `launch-token` implementations** —
+  each requires a hand-rolled IDL client. The `mpl-agent-registry` and `mpl-genesis`
+  Rust crates are not published on crates.io as of this writing (verified via
+  `cargo search`). PR 4 and PR 6 ship final stubs with the production `Tool` shape so
+  the registry surface is stable; the implementations land alongside the IDL clients.
+- **Full LLM-driven agent loop integration with `zeroclaw-runtime`** — the PR 6
+  `AGENT_CTX::scope` wraps the message dispatch correctly, but the dispatch still emits
+  the PR 2 stub echo reply. Replacing it with a real provider call + tool dispatch
+  loop requires touching `zeroclaw-runtime`'s observer / streaming surface in ways that
+  are out of scope for the port skeleton.
+- **SPEC §6.5 debug:* event stream** — `PlexChatDebugObserver` and the
+  `debug:step_start` / `tool_call` / `tool_result` / `text_delta` / `step_complete` /
+  `generation_complete` / `context` variants. The wire surface is reserved by the
+  `Server`/`ClientMsg` enums but unused.
+- **SPEC §6.7 budget enforcement** — `MAX_TOKENS_PER_MESSAGE`,
+  `MAX_TOOL_EXECUTIONS_PER_MESSAGE`, `MAX_RPC_TIME_BUDGET_MS`, and the
+  `CancellationToken::cancel()` + `finishReason: "budget_exceeded"` emission path.
+  Lands alongside the agent-loop integration.
+- **Full SPEC §6.6 late-ok matrix** — only the well-formed-signature-after-timeout path
+  is implemented; the autonomous-mode wallet-rejection edges land in PR 7+.
+- **SPEC §3.4 owner-cache invalidation on `register-agent` success** — the cache wires
+  in PR 1 with TTL eviction; the explicit invalidation hook on a successful
+  registration lands when the real `register-agent` ships.
+
+### Validation
+
+`cargo test -p zeroclaw-solana -p zeroclaw-tools -p zeroclaw-gateway` passes
+(165 + 79 + 1170 unit tests). `cargo clippy --all-targets -- -D warnings` is clean.
+`cargo fmt --all -- --check` is clean. Pre-existing failures in
+`zeroclaw-config::schema` and `zeroclaw-runtime::cron::scheduler` are not introduced by
+this port and are tracked separately.
