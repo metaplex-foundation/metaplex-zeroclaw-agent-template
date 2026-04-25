@@ -70,6 +70,10 @@ impl TxSendError {
 pub struct AgentContext {
     pub wallet_address: Option<Pubkey>,
     pub agent_mode: AgentMode,
+    /// Public key of the AGENT_KEYPAIR — used as funding destination, fee
+    /// payer in autonomous mode, and base for asset-signer PDA derivation
+    /// (PR 5/6).
+    pub agent_pubkey: Pubkey,
     pub agent_asset_address: Option<Pubkey>,
     pub agent_token_mint: Option<Pubkey>,
     pub agent_fee_sol: f64,
@@ -84,6 +88,7 @@ impl std::fmt::Debug for AgentContext {
         f.debug_struct("AgentContext")
             .field("wallet_address", &self.wallet_address)
             .field("agent_mode", &self.agent_mode)
+            .field("agent_pubkey", &self.agent_pubkey)
             .field("agent_asset_address", &self.agent_asset_address)
             .field("agent_token_mint", &self.agent_token_mint)
             .field("agent_fee_sol", &self.agent_fee_sol)
@@ -180,6 +185,7 @@ mod tests {
         let ctx = AgentContext {
             wallet_address: None,
             agent_mode: AgentMode::Public,
+            agent_pubkey: Pubkey::new_from_array([0u8; 32]),
             agent_asset_address: None,
             agent_token_mint: None,
             agent_fee_sol: 0.001,
@@ -202,6 +208,7 @@ mod tests {
         let ctx = AgentContext {
             wallet_address: None,
             agent_mode: AgentMode::Public,
+            agent_pubkey: Pubkey::new_from_array([0u8; 32]),
             agent_asset_address: None,
             agent_token_mint: None,
             agent_fee_sol: 0.001,

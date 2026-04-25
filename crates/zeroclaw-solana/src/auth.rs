@@ -118,6 +118,7 @@ mod tests {
         AgentContext {
             wallet_address: connected,
             agent_mode: AgentMode::Public,
+            agent_pubkey: pk(99),
             agent_asset_address: None,
             agent_token_mint: None,
             agent_fee_sol: 0.001,
