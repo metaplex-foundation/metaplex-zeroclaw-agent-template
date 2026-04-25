@@ -1,6 +1,7 @@
 //! Tool implementations for agent-callable capabilities.
 
 pub mod microsoft365;
+pub mod solana;
 pub mod util_helpers;
 
 pub mod ask_user;

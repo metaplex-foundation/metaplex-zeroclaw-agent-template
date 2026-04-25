@@ -12,6 +12,11 @@ zeroclaw-config = { workspace = true, default-features = true }
 zeroclaw-providers.workspace = true
 zeroclaw-memory.workspace = true
 zeroclaw-infra.workspace = true
+zeroclaw-solana.workspace = true
+solana-sdk = { workspace = true, features = ["full"] }
+solana-client.workspace = true
+solana-commitment-config = { version = "3", default-features = false }
+solana-transaction-status.workspace = true
 anyhow = "1.0"
 async-trait = "0.1"
 base64 = "0.22"
