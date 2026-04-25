@@ -207,6 +207,7 @@ mod tests {
     }
 
     #[derive(Debug, Clone, Default)]
+    #[allow(dead_code)]
     struct CapturedSend {
         tx_base64: String,
         opts: TxSendOpts,
@@ -214,6 +215,7 @@ mod tests {
 
     /// Test fake: captures the `(tx_base64, opts)` it would send, returns
     /// a canned signature instead of round-tripping through a wallet.
+    #[allow(dead_code)]
     struct CapturingSender {
         last: Arc<Mutex<Option<CapturedSend>>>,
         signature: Signature,
@@ -226,6 +228,7 @@ mod tests {
                 signature: Signature::from([7u8; 64]),
             }
         }
+        #[allow(dead_code)]
         fn last(&self) -> CapturedSend {
             self.last.lock().unwrap().clone().unwrap()
         }
@@ -244,6 +247,7 @@ mod tests {
     }
 
     /// Test fake that always rejects — used to assert error mapping.
+    #[allow(dead_code)]
     struct RejectingSender;
 
     #[async_trait]
@@ -469,7 +473,7 @@ mod tests {
         // Transaction with the right fee payer and instruction count.
         let user = pk(1);
         let original = system_instruction::transfer(&user, &pk(99), 5_000);
-        let mut tx = Transaction::new_with_payer(&[original.clone()], Some(&user));
+        let mut tx = Transaction::new_with_payer(std::slice::from_ref(&original), Some(&user));
         tx.message.recent_blockhash = Default::default();
         let serialized = bincode::serialize(&tx).unwrap();
         let b64 = base64::engine::general_purpose::STANDARD.encode(serialized);

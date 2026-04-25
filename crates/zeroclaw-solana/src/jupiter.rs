@@ -127,14 +127,14 @@ impl JupiterClient {
         let body = resp.text().await.unwrap_or_default();
         tracing::error!(target: "zeroclaw_solana::jupiter", %status, body=%truncate_llm_message(body.clone()), "jupiter HTTP error");
         // Jupiter sometimes returns helpful machine-readable hints in the
-        // body — bucket the most common patterns into typed codes.
+        // body — bucket the most common patterns into typed codes. Anything
+        // else (bad gateway, 4xx, 5xx) collapses into RpcFailure so the
+        // gateway can retry or fall back uniformly.
         let lc = body.to_ascii_lowercase();
         if lc.contains("slippage") {
             ToolErrorCode::SlippageTooHigh
         } else if lc.contains("price impact") {
             ToolErrorCode::PriceImpactTooHigh
-        } else if status.as_u16() == 429 || status.is_server_error() {
-            ToolErrorCode::RpcFailure
         } else {
             ToolErrorCode::RpcFailure
         }
@@ -290,9 +290,7 @@ pub async fn simulate_and_verify_swap(
 fn apply_slippage_floor(quoted_out: u128, slippage_bps: u16) -> u128 {
     let bps = u128::from(slippage_bps.min(10_000));
     // floor = quoted * (10_000 - bps) / 10_000
-    quoted_out
-        .saturating_mul(10_000u128.saturating_sub(bps))
-        / 10_000
+    quoted_out.saturating_mul(10_000u128.saturating_sub(bps)) / 10_000
 }
 
 /// Pure delta verifier extracted for unit tests.
@@ -392,7 +390,9 @@ mod tests {
                 ui_amount_string: amount.to_string(),
             },
             owner: OptionSerializer::Some(owner.to_string()),
-            program_id: OptionSerializer::Some("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".into()),
+            program_id: OptionSerializer::Some(
+                "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".into(),
+            ),
         }
     }
 
