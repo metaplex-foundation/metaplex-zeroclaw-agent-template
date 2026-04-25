@@ -746,120 +746,106 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
     // real tokens via `zeroclaw config edit` or the dashboard.
     let channel = app.selected_channel();
     match channel {
-        "Telegram" => {
-            if config.channels.telegram.is_none() {
-                config.channels.telegram = Some(TelegramConfig {
-                    enabled: true,
-                    bot_token: String::from("YOUR_TELEGRAM_BOT_TOKEN"),
-                    allowed_users: vec![],
-                    stream_mode: StreamMode::default(),
-                    draft_update_interval_ms: 1000,
-                    interrupt_on_new_message: false,
-                    mention_only: false,
-                    ack_reactions: None,
-                    proxy_url: None,
-                    approval_timeout_secs: 120,
-                });
-            }
+        "Telegram" if config.channels.telegram.is_none() => {
+            config.channels.telegram = Some(TelegramConfig {
+                enabled: true,
+                bot_token: String::from("YOUR_TELEGRAM_BOT_TOKEN"),
+                allowed_users: vec![],
+                stream_mode: StreamMode::default(),
+                draft_update_interval_ms: 1000,
+                interrupt_on_new_message: false,
+                mention_only: false,
+                ack_reactions: None,
+                proxy_url: None,
+                approval_timeout_secs: 120,
+            });
         }
-        "Discord" => {
-            if config.channels.discord.is_none() {
-                config.channels.discord = Some(DiscordConfig {
-                    enabled: true,
-                    bot_token: String::from("YOUR_DISCORD_BOT_TOKEN"),
-                    guild_id: None,
-                    allowed_users: vec![],
-                    listen_to_bots: false,
-                    interrupt_on_new_message: false,
-                    mention_only: false,
-                    proxy_url: None,
-                    stream_mode: StreamMode::default(),
-                    draft_update_interval_ms: 1000,
-                    multi_message_delay_ms: 800,
-                    stall_timeout_secs: 0,
-                });
-            }
+        "Discord" if config.channels.discord.is_none() => {
+            config.channels.discord = Some(DiscordConfig {
+                enabled: true,
+                bot_token: String::from("YOUR_DISCORD_BOT_TOKEN"),
+                guild_id: None,
+                allowed_users: vec![],
+                listen_to_bots: false,
+                interrupt_on_new_message: false,
+                mention_only: false,
+                proxy_url: None,
+                stream_mode: StreamMode::default(),
+                draft_update_interval_ms: 1000,
+                multi_message_delay_ms: 800,
+                stall_timeout_secs: 0,
+            });
         }
-        "Slack" => {
-            if config.channels.slack.is_none() {
-                config.channels.slack = Some(SlackConfig {
-                    enabled: true,
-                    bot_token: String::from("xoxb-YOUR_SLACK_BOT_TOKEN"),
-                    app_token: Some(String::from("xapp-YOUR_SLACK_APP_TOKEN")),
-                    channel_ids: vec![],
-                    allowed_users: vec![],
-                    interrupt_on_new_message: false,
-                    thread_replies: None,
-                    mention_only: false,
-                    use_markdown_blocks: false,
-                    proxy_url: None,
-                    stream_drafts: false,
-                    draft_update_interval_ms: 1200,
-                    cancel_reaction: None,
-                });
-            }
+        "Slack" if config.channels.slack.is_none() => {
+            config.channels.slack = Some(SlackConfig {
+                enabled: true,
+                bot_token: String::from("xoxb-YOUR_SLACK_BOT_TOKEN"),
+                app_token: Some(String::from("xapp-YOUR_SLACK_APP_TOKEN")),
+                channel_ids: vec![],
+                allowed_users: vec![],
+                interrupt_on_new_message: false,
+                thread_replies: None,
+                mention_only: false,
+                use_markdown_blocks: false,
+                proxy_url: None,
+                stream_drafts: false,
+                draft_update_interval_ms: 1200,
+                cancel_reaction: None,
+            });
         }
-        "WhatsApp" => {
-            if config.channels.whatsapp.is_none() {
-                config.channels.whatsapp = Some(WhatsAppConfig {
-                    enabled: true,
-                    access_token: Some(String::from("YOUR_WHATSAPP_ACCESS_TOKEN")),
-                    phone_number_id: Some(String::from("YOUR_PHONE_NUMBER_ID")),
-                    verify_token: Some(String::from("YOUR_VERIFY_TOKEN")),
-                    app_secret: None,
-                    session_path: None,
-                    pair_phone: None,
-                    pair_code: None,
-                    allowed_numbers: vec![],
-                    mention_only: false,
-                    mode: WhatsAppWebMode::default(),
-                    dm_policy: WhatsAppChatPolicy::default(),
-                    group_policy: WhatsAppChatPolicy::default(),
-                    self_chat_mode: false,
-                    dm_mention_patterns: vec![],
-                    group_mention_patterns: vec![],
-                    proxy_url: None,
-                });
-            }
+        "WhatsApp" if config.channels.whatsapp.is_none() => {
+            config.channels.whatsapp = Some(WhatsAppConfig {
+                enabled: true,
+                access_token: Some(String::from("YOUR_WHATSAPP_ACCESS_TOKEN")),
+                phone_number_id: Some(String::from("YOUR_PHONE_NUMBER_ID")),
+                verify_token: Some(String::from("YOUR_VERIFY_TOKEN")),
+                app_secret: None,
+                session_path: None,
+                pair_phone: None,
+                pair_code: None,
+                allowed_numbers: vec![],
+                mention_only: false,
+                mode: WhatsAppWebMode::default(),
+                dm_policy: WhatsAppChatPolicy::default(),
+                group_policy: WhatsAppChatPolicy::default(),
+                self_chat_mode: false,
+                dm_mention_patterns: vec![],
+                group_mention_patterns: vec![],
+                proxy_url: None,
+            });
         }
-        "Signal" => {
-            if config.channels.signal.is_none() {
-                config.channels.signal = Some(SignalConfig {
-                    enabled: true,
-                    http_url: String::from("http://127.0.0.1:8080"),
-                    account: String::from("YOUR_SIGNAL_PHONE_NUMBER"),
-                    group_id: None,
-                    allowed_from: vec![],
-                    ignore_attachments: false,
-                    ignore_stories: true,
-                    proxy_url: None,
-                });
-            }
+        "Signal" if config.channels.signal.is_none() => {
+            config.channels.signal = Some(SignalConfig {
+                enabled: true,
+                http_url: String::from("http://127.0.0.1:8080"),
+                account: String::from("YOUR_SIGNAL_PHONE_NUMBER"),
+                group_id: None,
+                allowed_from: vec![],
+                ignore_attachments: false,
+                ignore_stories: true,
+                proxy_url: None,
+            });
         }
-        "IRC" => {
-            if config.channels.irc.is_none() {
-                config.channels.irc = Some(IrcConfig {
-                    enabled: true,
-                    server: String::from("irc.libera.chat"),
-                    port: 6697,
-                    nickname: String::from("zeroclaw-bot"),
-                    username: None,
-                    channels: vec![String::from("#your-channel")],
-                    allowed_users: vec![],
-                    server_password: None,
-                    nickserv_password: None,
-                    sasl_password: None,
-                    verify_tls: None,
-                });
-            }
+        "IRC" if config.channels.irc.is_none() => {
+            config.channels.irc = Some(IrcConfig {
+                enabled: true,
+                server: String::from("irc.libera.chat"),
+                port: 6697,
+                nickname: String::from("zeroclaw-bot"),
+                username: None,
+                channels: vec![String::from("#your-channel")],
+                allowed_users: vec![],
+                server_password: None,
+                nickserv_password: None,
+                sasl_password: None,
+                verify_tls: None,
+            });
         }
-        "iMessage" => {
-            if config.channels.imessage.is_none() {
-                config.channels.imessage = Some(IMessageConfig {
-                    enabled: true,
-                    allowed_contacts: vec![],
-                });
-            }
+        "iMessage" if config.channels.imessage.is_none() => {
+            config.channels.imessage = Some(IMessageConfig {
+                enabled: true,
+                allowed_contacts: vec![],
+            });
         }
         "Matrix" => {
             let existing_mx = config.channels.matrix.as_ref();
@@ -882,33 +868,29 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
                 });
             }
         }
-        "Mattermost" => {
-            if config.channels.mattermost.is_none() {
-                config.channels.mattermost = Some(MattermostConfig {
-                    enabled: true,
-                    url: String::from("https://mattermost.example.com"),
-                    bot_token: String::from("YOUR_MATTERMOST_BOT_TOKEN"),
-                    channel_id: None,
-                    allowed_users: vec![],
-                    thread_replies: None,
-                    mention_only: None,
-                    interrupt_on_new_message: false,
-                    proxy_url: None,
-                });
-            }
+        "Mattermost" if config.channels.mattermost.is_none() => {
+            config.channels.mattermost = Some(MattermostConfig {
+                enabled: true,
+                url: String::from("https://mattermost.example.com"),
+                bot_token: String::from("YOUR_MATTERMOST_BOT_TOKEN"),
+                channel_id: None,
+                allowed_users: vec![],
+                thread_replies: None,
+                mention_only: None,
+                interrupt_on_new_message: false,
+                proxy_url: None,
+            });
         }
-        "Nextcloud Talk" => {
-            if config.channels.nextcloud_talk.is_none() {
-                config.channels.nextcloud_talk = Some(NextcloudTalkConfig {
-                    enabled: true,
-                    base_url: String::from("https://cloud.example.com"),
-                    app_token: String::from("YOUR_NEXTCLOUD_APP_TOKEN"),
-                    webhook_secret: None,
-                    allowed_users: vec![],
-                    proxy_url: None,
-                    bot_name: None,
-                });
-            }
+        "Nextcloud Talk" if config.channels.nextcloud_talk.is_none() => {
+            config.channels.nextcloud_talk = Some(NextcloudTalkConfig {
+                enabled: true,
+                base_url: String::from("https://cloud.example.com"),
+                app_token: String::from("YOUR_NEXTCLOUD_APP_TOKEN"),
+                webhook_secret: None,
+                allowed_users: vec![],
+                proxy_url: None,
+                bot_name: None,
+            });
         }
         "Feishu/Lark" => {
             if config.channels.feishu.is_none() {
