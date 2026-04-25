@@ -145,6 +145,7 @@ mod tests {
             wallet_address: None,
             agent_mode: AgentMode::Autonomous,
             agent_pubkey: pk(2),
+            agent_keypair: None,
             agent_asset_address: None,
             agent_token_mint: None,
             agent_fee_sol: 0.001,

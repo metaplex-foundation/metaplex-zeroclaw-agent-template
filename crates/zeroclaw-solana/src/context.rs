@@ -5,7 +5,7 @@ use crate::error_codes::ToolErrorCode;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use solana_sdk::pubkey::Pubkey;
-use solana_sdk::signature::Signature;
+use solana_sdk::signature::{Keypair, Signature};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,6 +74,12 @@ pub struct AgentContext {
     /// payer in autonomous mode, and base for asset-signer PDA derivation
     /// (PR 5/6).
     pub agent_pubkey: Pubkey,
+    /// The actual agent keypair, when the gateway is configured to allow
+    /// agent-signed transactions in this session. Required by tools whose
+    /// SPEC §10.4 contract is "agent signs and submits directly" (e.g.
+    /// `swap-token`, `buyback-token`, `sell-token`). Public mode sessions
+    /// that only proxy user-signed txs leave this `None`.
+    pub agent_keypair: Option<Arc<Keypair>>,
     pub agent_asset_address: Option<Pubkey>,
     pub agent_token_mint: Option<Pubkey>,
     pub agent_fee_sol: f64,
@@ -89,6 +95,10 @@ impl std::fmt::Debug for AgentContext {
             .field("wallet_address", &self.wallet_address)
             .field("agent_mode", &self.agent_mode)
             .field("agent_pubkey", &self.agent_pubkey)
+            .field(
+                "agent_keypair",
+                &self.agent_keypair.as_ref().map(|_| "<Keypair>"),
+            )
             .field("agent_asset_address", &self.agent_asset_address)
             .field("agent_token_mint", &self.agent_token_mint)
             .field("agent_fee_sol", &self.agent_fee_sol)
@@ -186,6 +196,7 @@ mod tests {
             wallet_address: None,
             agent_mode: AgentMode::Public,
             agent_pubkey: Pubkey::new_from_array([0u8; 32]),
+            agent_keypair: None,
             agent_asset_address: None,
             agent_token_mint: None,
             agent_fee_sol: 0.001,
@@ -209,6 +220,7 @@ mod tests {
             wallet_address: None,
             agent_mode: AgentMode::Public,
             agent_pubkey: Pubkey::new_from_array([0u8; 32]),
+            agent_keypair: None,
             agent_asset_address: None,
             agent_token_mint: None,
             agent_fee_sol: 0.001,
