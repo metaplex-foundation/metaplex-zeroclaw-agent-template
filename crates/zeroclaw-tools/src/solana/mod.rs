@@ -73,7 +73,8 @@ mod tests {
             .iter()
             .map(|t| t.name().to_string())
             .collect();
-        // PR 3 added the read-only subset; PR 4 added identity stubs.
+        // PR 3 added the read-only subset; PR 4 added identity stubs;
+        // PR 6 added the launch-token stub.
         let expected = [
             "get-balance",
             "get-token-balances",
@@ -83,6 +84,7 @@ mod tests {
             "sleep",
             "register-agent",
             "delegate-execution",
+            "launch-token",
         ];
         for e in &expected {
             assert!(names.iter().any(|n| n == e), "missing {e}");

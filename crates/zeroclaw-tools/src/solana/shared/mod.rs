@@ -2,10 +2,10 @@
 //!
 //! PR 3 ships the read-only subset (SPEC §5.1, top half of the shared
 //! table). Identity / treasury tools land in PR 4–6. The
-//! `register-agent` and `delegate-execution` tools are wired in as
-//! NOT_IMPLEMENTED stubs in PR 4 so the registry surface is final;
-//! the real implementations land alongside the hand-rolled MPL Agent
-//! Registry IDL client.
+//! `register-agent`, `delegate-execution`, and `launch-token` tools are
+//! wired in as NOT_IMPLEMENTED stubs (PRs 4 + 6) so the registry surface
+//! is final; the real implementations land alongside the hand-rolled
+//! MPL Agent Registry / MPL Genesis IDL clients.
 
 pub mod buyback_token;
 pub mod delegate_execution;
@@ -15,6 +15,7 @@ pub mod get_token_metadata;
 pub mod get_token_price;
 pub mod get_transaction;
 pub mod jupiter_swap;
+pub mod launch_token;
 pub mod register_agent;
 pub mod sell_token;
 pub mod sleep;
@@ -36,6 +37,7 @@ pub fn shared_tools() -> Vec<Arc<dyn Tool>> {
         with_auth(sleep::Sleep, AuthLevel::Public),
         with_auth(register_agent::RegisterAgent, AuthLevel::Owner),
         with_auth(delegate_execution::DelegateExecution, AuthLevel::Owner),
+        with_auth(launch_token::LaunchToken, AuthLevel::Owner),
         with_auth(swap_token::SwapToken, AuthLevel::Owner),
         with_auth(buyback_token::BuybackToken, AuthLevel::Owner),
         with_auth(sell_token::SellToken, AuthLevel::Owner),
