@@ -1675,6 +1675,7 @@ mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             canvas_store: zeroclaw_runtime::tools::CanvasStore::new(),
+            plexchat_active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         }

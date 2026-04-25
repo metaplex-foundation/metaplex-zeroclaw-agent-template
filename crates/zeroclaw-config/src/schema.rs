@@ -452,6 +452,17 @@ pub struct Config {
     #[serde(default)]
     #[nested]
     pub shell_tool: ShellToolConfig,
+
+    /// PlexChat WebSocket gateway configuration (`[plexchat]`).
+    ///
+    /// Controls the SPEC §6 PlexChat protocol surface mounted at
+    /// `/ws/plexchat`. All fields default to unset; the route is harmless
+    /// (handshake only, no Solana state) until `web_channel_token` and
+    /// `agent_keypair` are populated, at which point the gateway preflights
+    /// the keypair + RPC before binding.
+    #[serde(default)]
+    #[nested]
+    pub plexchat: PlexChatConfig,
 }
 
 /// Multi-client workspace isolation configuration.
@@ -2966,6 +2977,54 @@ impl Default for ShellToolConfig {
             timeout_secs: default_shell_tool_timeout_secs(),
         }
     }
+}
+
+// ── PlexChat (SPEC §6 WebSocket route) ───────────────────────────
+
+/// Minimal PlexChat configuration (`[plexchat]` section) — PR 2 surface.
+///
+/// All fields are `Option<String>` so the section can be omitted entirely
+/// without breaking existing configs. The full SolanaAgentConfig (SPEC
+/// §8.1) lands in PR 3 once the LLM agent loop wires in.
+///
+/// Field semantics:
+/// - `agent_mode`: `"public"` (default) or `"autonomous"`. Parsed into
+///   `zeroclaw_solana::context::AgentMode` downstream by the handler.
+/// - `solana_rpc_url`: Solana JSON-RPC endpoint for preflight + future
+///   tool RPC calls. Required when plexchat is otherwise enabled.
+/// - `agent_keypair`: Base58 secret key (or JSON byte array) for the
+///   agent identity. Required when plexchat is enabled.
+/// - `bootstrap_wallet`: Optional autonomous-mode pre-registration
+///   owner pubkey (used during the first-boot bootstrap flow in PR 4).
+/// - `agent_asset_address`: Operator-only override for the persisted
+///   agent asset address. PR 4 will auto-manage this; for PR 2 it lets
+///   operators pin an address manually.
+/// - `web_channel_token`: WebSocket bearer token. Must be at least 32
+///   chars when set; the gateway preflight aborts startup otherwise.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "plexchat"]
+pub struct PlexChatConfig {
+    /// Operating mode: `"public"` or `"autonomous"`.
+    #[serde(default)]
+    pub agent_mode: Option<String>,
+    /// Solana RPC URL.
+    #[serde(default)]
+    pub solana_rpc_url: Option<String>,
+    /// Base58 secret key (or JSON byte array). Required when plexchat is enabled.
+    #[serde(default)]
+    #[secret]
+    pub agent_keypair: Option<String>,
+    /// Bootstrap wallet pubkey (autonomous-mode pre-registration owner).
+    #[serde(default)]
+    pub bootstrap_wallet: Option<String>,
+    /// Persisted agent asset address (auto-managed in PR 4 — operator-only override here).
+    #[serde(default)]
+    pub agent_asset_address: Option<String>,
+    /// WebSocket auth token. Must be at least 32 chars when set.
+    #[serde(default)]
+    #[secret]
+    pub web_channel_token: Option<String>,
 }
 
 // ── Web search ───────────────────────────────────────────────────
@@ -9177,6 +9236,7 @@ impl Default for Config {
             opencode_cli: OpenCodeCliConfig::default(),
             sop: SopConfig::default(),
             shell_tool: ShellToolConfig::default(),
+            plexchat: PlexChatConfig::default(),
         }
     }
 }
@@ -11803,6 +11863,7 @@ auto_save = true
             opencode_cli: OpenCodeCliConfig::default(),
             sop: SopConfig::default(),
             shell_tool: ShellToolConfig::default(),
+            plexchat: PlexChatConfig::default(),
         };
         // Provider fields are now resolved directly — no cache needed.
 
@@ -12372,6 +12433,7 @@ default_temperature = 0.7
             opencode_cli: OpenCodeCliConfig::default(),
             sop: SopConfig::default(),
             shell_tool: ShellToolConfig::default(),
+            plexchat: PlexChatConfig::default(),
         };
 
         // Provider fields are now resolved directly — no cache needed.

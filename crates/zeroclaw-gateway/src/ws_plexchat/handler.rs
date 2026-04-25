@@ -7,9 +7,9 @@
 //!   HTTP 401 (no upgrade) when the token is missing or unrecognised.
 //! - Echo the SPEC §6.2 `bearer` subprotocol on accept when the client
 //!   advertised it.
-//! - Enforce a process-wide `MAX_CONNECTIONS = 10` cap by tracking a
-//!   `PLEXCHAT_ACTIVE` counter; exceeding the cap closes with code 4002.
-//!   (PR 2 Task 6 will move this counter onto `AppState`.)
+//! - Enforce a per-`AppState` `MAX_CONNECTIONS = 10` cap by tracking the
+//!   `state.plexchat_active` counter; exceeding the cap closes with
+//!   code 4002.
 //! - On accept, install a [`PlexChatSession`], emit
 //!   `ServerMsg::Connected { jid }`, and run the receive loop.
 //! - Dispatch every `ClientMsg` variant per SPEC §6.3:
@@ -28,7 +28,7 @@
 
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
@@ -72,15 +72,8 @@ const BEARER_SUBPROTOCOL: &str = "bearer";
 /// Hard cap on concurrent PlexChat connections for PR 2.
 ///
 /// The full gateway config will gain a `[plexchat] max_connections`
-/// field in PR 2 Task 6; until then this is the SPEC §6.2 default.
+/// field in PR 3+; until then this is the SPEC §6.2 default.
 pub const MAX_CONNECTIONS: usize = 10;
-
-/// Process-global active-connection gauge.
-///
-/// Lives here (not on `AppState`) for PR 2 to keep the change well-scoped
-/// to the new module; PR 2 Task 6 moves it onto `AppState` so it can be
-/// observed alongside the rest of the gateway state.
-pub static PLEXCHAT_ACTIVE: AtomicUsize = AtomicUsize::new(0);
 
 /// Query parameters accepted on the upgrade request. Only `token` is used
 /// in PR 2 — additional params (e.g. `mode`) land alongside config wiring
@@ -139,25 +132,29 @@ pub async fn handle_ws_plexchat(
 }
 
 /// Drive a single PlexChat connection from upgrade to close.
-async fn handle_socket(socket: WebSocket, _state: AppState) {
+async fn handle_socket(socket: WebSocket, state: AppState) {
+    let active = state.plexchat_active.clone();
+
     // ── MAX_CONNECTIONS gate ──────────────────────────────────────────
     // We increment optimistically and roll back on overflow so the check
     // is race-free without a mutex. `fetch_add` returns the prior value.
-    let prior = PLEXCHAT_ACTIVE.fetch_add(1, Ordering::AcqRel);
+    let prior = active.fetch_add(1, Ordering::AcqRel);
     if prior >= MAX_CONNECTIONS {
-        PLEXCHAT_ACTIVE.fetch_sub(1, Ordering::AcqRel);
+        active.fetch_sub(1, Ordering::AcqRel);
         send_close(socket, CLOSE_TOO_MANY, "Too many connections").await;
         return;
     }
 
-    // PR 2 Task 6 will read the agent mode from config; for now every
-    // connection runs in Public mode.
+    // PR 3 will read the agent mode from `state.config.lock().plexchat`
+    // (`PlexChatConfig::agent_mode`). For now every connection runs in
+    // Public mode — autonomous-mode owner verification ships with the
+    // tool-dispatch wiring.
     let session = PlexChatSession::new(AgentMode::Public);
     let jid = session.jid.clone();
 
     info!(
         jid = %jid,
-        active = PLEXCHAT_ACTIVE.load(Ordering::Acquire),
+        active = active.load(Ordering::Acquire),
         "PlexChat connection accepted"
     );
 
@@ -168,11 +165,11 @@ async fn handle_socket(socket: WebSocket, _state: AppState) {
 
     session.abort.cancel();
     session.reject_all_pending();
-    PLEXCHAT_ACTIVE.fetch_sub(1, Ordering::AcqRel);
+    active.fetch_sub(1, Ordering::AcqRel);
 
     info!(
         jid = %jid,
-        active = PLEXCHAT_ACTIVE.load(Ordering::Acquire),
+        active = active.load(Ordering::Acquire),
         "PlexChat connection closed"
     );
 }
@@ -792,6 +789,7 @@ mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             canvas_store: zeroclaw_runtime::tools::CanvasStore::new(),
+            plexchat_active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         }
@@ -837,9 +835,11 @@ mod tests {
     /// `Connected { jid }` frame with a non-empty jid.
     #[tokio::test]
     async fn connected_emitted_on_accept() {
+        let state = test_state();
+        let active = state.plexchat_active.clone();
         let app = Router::new()
             .route("/ws/plexchat", get(handle_ws_plexchat))
-            .with_state(test_state());
+            .with_state(state);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr: SocketAddr = listener.local_addr().unwrap();
@@ -886,16 +886,15 @@ mod tests {
         assert_eq!(v["type"], "connected");
         assert!(v["jid"].as_str().is_some_and(|s| !s.is_empty()));
 
-        // Counter reflects the open connection. Other dispatch tests in
-        // this module may run in parallel, so we assert "at least one
-        // active" rather than an exact value — the counter is global to
-        // the test binary and the previous `>=` semantics are sufficient
-        // to prove the increment happened.
-        let pre_close = PLEXCHAT_ACTIVE.load(Ordering::Acquire);
-        assert!(
-            pre_close >= 1,
-            "expected at least one active connection, got {pre_close}"
-        );
+        // Counter reflects the open connection. The gauge is now scoped
+        // to this test's `AppState` so we can assert exactly 1.
+        for _ in 0..50 {
+            if active.load(Ordering::Acquire) >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(active.load(Ordering::Acquire), 1);
 
         // Clean shutdown — close the client and wait for the server to
         // tear down its side so the counter decrements before we assert.
@@ -911,19 +910,14 @@ mod tests {
         .await;
 
         // Give the server task a moment to run cleanup. We expect the
-        // counter to drop by at least one — i.e. *our* connection's
-        // increment was rolled back.
+        // counter to drop back to zero.
         for _ in 0..50 {
-            if PLEXCHAT_ACTIVE.load(Ordering::Acquire) < pre_close {
+            if active.load(Ordering::Acquire) == 0 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        let post_close = PLEXCHAT_ACTIVE.load(Ordering::Acquire);
-        assert!(
-            post_close < pre_close,
-            "counter did not decrement after close: {pre_close} -> {post_close}"
-        );
+        assert_eq!(active.load(Ordering::Acquire), 0);
 
         server.abort();
         let _ = server.await;
@@ -1263,6 +1257,133 @@ mod tests {
             while ws.next().await.is_some() {}
         })
         .await;
+        server.abort();
+        let _ = server.await;
+    }
+
+    // ── PR 2 Task 6 integration tests ─────────────────────────────────
+
+    /// Build an `AppState` with pairing required and one valid bearer
+    /// token. Used by `wrong_token_returns_401` to exercise the auth gate.
+    fn test_state_with_pairing(token: &str) -> AppState {
+        use parking_lot::Mutex;
+        use zeroclaw_config::schema::Config;
+        use zeroclaw_runtime::security::pairing::PairingGuard;
+
+        let mut state = test_state();
+        state.config = Arc::new(Mutex::new(Config::default()));
+        state.pairing = Arc::new(PairingGuard::new(true, &[token.to_string()]));
+        state
+    }
+
+    /// Spawn the PlexChat route on a random localhost port using the
+    /// supplied `AppState`. Mirrors `spawn_test_server` but lets callers
+    /// inject auth/state knobs.
+    async fn spawn_with_state(state: AppState) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let app = Router::new()
+            .route("/ws/plexchat", get(handle_ws_plexchat))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                })
+                .await;
+        });
+        (addr, server)
+    }
+
+    /// SPEC §6.2: a wrong bearer token must produce HTTP 401 *without*
+    /// completing the WebSocket upgrade. We use `reqwest` to issue a
+    /// straight HTTP request rather than `tokio_tungstenite::connect_async`
+    /// because tungstenite collapses non-101 responses into a generic
+    /// error and we want to assert the status code precisely.
+    #[tokio::test]
+    async fn wrong_token_returns_401() {
+        let state = test_state_with_pairing("the-real-token");
+        let (addr, server) = spawn_with_state(state).await;
+
+        let url = format!("http://{addr}/ws/plexchat");
+        // Build the upgrade headers by hand. The server's `extract_ws_token`
+        // accepts any of the SPEC §6.2 carriers; we intentionally send the
+        // wrong token via Authorization to provoke a 401.
+        let resp = reqwest::Client::new()
+            .get(&url)
+            .header("authorization", "Bearer not-the-real-token")
+            .header("connection", "upgrade")
+            .header("upgrade", "websocket")
+            .header("sec-websocket-version", "13")
+            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .send()
+            .await
+            .expect("HTTP request failed");
+
+        assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    /// SPEC §6.2: opening more than `MAX_CONNECTIONS` connections in
+    /// parallel must close the surplus ones with code 4002.
+    ///
+    /// The active-connection gauge now lives on `AppState`, so this test
+    /// is hermetic — it doesn't race with other tests on a process-global
+    /// static. We open `MAX_CONNECTIONS` connections, then the
+    /// `(MAX + 1)`th, and assert the surplus closes with 4002.
+    #[tokio::test]
+    async fn max_connections_returns_4002() {
+        let (addr, server) = spawn_test_server().await;
+
+        // Hold the first MAX_CONNECTIONS connections open until the test
+        // is done so the server's gauge stays saturated.
+        let mut held = Vec::with_capacity(MAX_CONNECTIONS);
+        for _ in 0..MAX_CONNECTIONS {
+            let ws = connect_and_skip_connected(addr).await;
+            held.push(ws);
+        }
+
+        // Now open one more. The handshake completes (HTTP 101) but the
+        // server immediately sends a Close(4002) — we should observe it
+        // as the very first frame after upgrade.
+        let url = format!("ws://{addr}/ws/plexchat");
+        let mut request = url.into_client_request().unwrap();
+        request.headers_mut().insert(
+            "sec-websocket-protocol",
+            HeaderValue::from_static("bearer, test-token"),
+        );
+        let (mut surplus, _resp) = tokio_tungstenite::connect_async(request).await.unwrap();
+
+        // Drain frames until we either see the close or hit the timeout.
+        // tokio-tungstenite delivers Close as a `Message::Close` frame
+        // and then yields `None` (or an error) on the next read.
+        let mut got_close_4002 = false;
+        for _ in 0..4 {
+            let frame = tokio::time::timeout(Duration::from_secs(2), surplus.next()).await;
+            match frame {
+                Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Close(Some(cf))))) => {
+                    let code: u16 = cf.code.into();
+                    assert_eq!(
+                        code, CLOSE_TOO_MANY,
+                        "expected close 4002, got {code} ({})",
+                        cf.reason
+                    );
+                    got_close_4002 = true;
+                    break;
+                }
+                Ok(Some(Ok(_))) => continue,
+                Ok(Some(Err(_))) | Ok(None) | Err(_) => break,
+            }
+        }
+        assert!(
+            got_close_4002,
+            "surplus connection did not receive close 4002"
+        );
+
+        // Drop the held connections so the server cleans up.
+        drop(held);
         server.abort();
         let _ = server.await;
     }

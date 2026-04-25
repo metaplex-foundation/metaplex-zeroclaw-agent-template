@@ -382,9 +382,80 @@ pub struct AppState {
     pub pending_pairings: Option<Arc<api_pairing::PairingStore>>,
     /// Shared canvas store for Live Canvas (A2UI) system
     pub canvas_store: CanvasStore,
+    /// Active PlexChat WebSocket connection counter (SPEC §6.2 cap).
+    ///
+    /// Tracked on `AppState` (rather than a file-static) so each test's
+    /// router carries its own gauge. Production wiring constructs this
+    /// fresh in [`run_gateway`]; tests mint their own per-server.
+    pub plexchat_active: Arc<std::sync::atomic::AtomicUsize>,
     /// WebAuthn state for hardware key authentication (optional, requires `webauthn` feature)
     #[cfg(feature = "webauthn")]
     pub webauthn: Option<Arc<api_webauthn::WebAuthnState>>,
+}
+
+/// PlexChat preflight (SPEC §6.8) — runs before the gateway binds.
+///
+/// Treats plexchat as "enabled" only when both `web_channel_token` and
+/// `agent_keypair` are set. When enabled, this:
+///
+/// 1. Validates that `web_channel_token` is at least 32 chars (SPEC §6.2
+///    minimum entropy floor for the WS bearer token).
+/// 2. Decodes `agent_keypair` via [`zeroclaw_solana::keypair::decode`] —
+///    accepts both base58 secret keys and JSON byte arrays.
+/// 3. Pings the configured `solana_rpc_url` via
+///    [`zeroclaw_solana::client::SolanaClient::preflight`] (`get_slot`).
+///
+/// Any failure returns an `anyhow::Error` so the surrounding
+/// `run_gateway` future propagates it via `Result<()>` — the binary's
+/// startup path then surfaces a descriptive message and exits non-zero,
+/// without requiring this helper to call `std::process::exit` directly.
+async fn plexchat_preflight(config: &Config) -> Result<()> {
+    let pc = &config.plexchat;
+    let (Some(token), Some(keypair_raw)) =
+        (pc.web_channel_token.as_deref(), pc.agent_keypair.as_deref())
+    else {
+        // Plexchat is not configured — preflight is a no-op. The route is
+        // still mounted but the lack of token means every upgrade will fail
+        // the auth gate.
+        return Ok(());
+    };
+
+    // 1. Token length floor.
+    if token.chars().count() < 32 {
+        tracing::error!(
+            "PlexChat preflight failed: web_channel_token must be at least 32 characters"
+        );
+        anyhow::bail!("plexchat.web_channel_token is shorter than 32 characters");
+    }
+
+    // 2. Decode the agent keypair (no I/O — just parsing).
+    if let Err(e) = zeroclaw_solana::keypair::decode(keypair_raw) {
+        tracing::error!("PlexChat preflight failed: agent_keypair did not decode: {e:#}");
+        return Err(anyhow::anyhow!(
+            "plexchat.agent_keypair did not decode: {e}"
+        ));
+    }
+
+    // 3. RPC reachability via get_slot. Default to mainnet-beta when
+    // unset so operators can experiment with a token + keypair without
+    // having to pick an RPC explicitly — but log a warning so misconfig
+    // is visible.
+    let rpc_url = pc.solana_rpc_url.as_deref().unwrap_or_else(|| {
+        tracing::warn!("plexchat.solana_rpc_url unset — defaulting to mainnet-beta for preflight");
+        "https://api.mainnet-beta.solana.com"
+    });
+    let client = zeroclaw_solana::client::SolanaClient::new(rpc_url);
+    if let Err(e) = client.preflight().await {
+        tracing::error!(
+            "PlexChat preflight failed: RPC {rpc_url} did not respond to get_slot: {e:#}"
+        );
+        return Err(anyhow::anyhow!(
+            "plexchat preflight: RPC {rpc_url} did not respond: {e}"
+        ));
+    }
+
+    tracing::info!("PlexChat preflight ok (rpc={rpc_url})");
+    Ok(())
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -416,6 +487,16 @@ pub async fn run_gateway(
     } else {
         None
     };
+
+    // ── PlexChat preflight (SPEC §6.8) ─────────────────────────────
+    // When the operator has populated both the WS auth token and the
+    // agent keypair, we treat plexchat as "enabled" and prove that:
+    //   1. The keypair decodes cleanly (base58 or JSON byte array).
+    //   2. The configured Solana RPC responds to `get_slot`.
+    //   3. The token is at least 32 chars (mirrors SPEC §6.2 minimum).
+    // Any failure aborts startup BEFORE we bind the listener so the
+    // gateway never serves PlexChat in a half-configured state.
+    plexchat_preflight(&config).await?;
 
     let addr: SocketAddr = format!("{host}:{port}").parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -828,6 +909,7 @@ pub async fn run_gateway(
     }
     println!("  GET  {pfx}/api/*     — REST API (bearer token required)");
     println!("  GET  {pfx}/ws/chat   — WebSocket agent chat");
+    println!("  GET  {pfx}/ws/plexchat — WebSocket PlexChat (SPEC §6)");
     if config.nodes.enabled {
         println!("  GET  {pfx}/ws/nodes  — WebSocket node discovery");
     }
@@ -906,6 +988,7 @@ pub async fn run_gateway(
         path_prefix: path_prefix.unwrap_or("").to_string(),
         web_dist_dir,
         canvas_store,
+        plexchat_active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         #[cfg(feature = "webauthn")]
         webauthn: if config.security.webauthn.enabled {
             let secret_store = Arc::new(zeroclaw_runtime::security::SecretStore::new(
@@ -1059,6 +1142,11 @@ pub async fn run_gateway(
         .route("/api/events/history", get(sse::handle_events_history))
         // ── WebSocket agent chat ──
         .route("/ws/chat", get(ws::handle_ws_chat))
+        // ── WebSocket PlexChat (SPEC §6) ──
+        .route(
+            "/ws/plexchat",
+            get(ws_plexchat::handler::handle_ws_plexchat),
+        )
         // ── WebSocket canvas updates ──
         .route("/ws/canvas/{id}", get(canvas::handle_ws_canvas))
         // ── WebSocket node discovery ──
@@ -2424,6 +2512,7 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            plexchat_active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -2496,6 +2585,7 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            plexchat_active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -2894,6 +2984,7 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            plexchat_active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -2974,6 +3065,7 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            plexchat_active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -3066,6 +3158,7 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            plexchat_active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -3130,6 +3223,7 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            plexchat_active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -3199,6 +3293,7 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            plexchat_active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -3273,6 +3368,7 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            plexchat_active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -3344,6 +3440,7 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            plexchat_active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
