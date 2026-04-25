@@ -42,9 +42,10 @@ use axum::{
 use futures_util::{SinkExt, StreamExt, stream::SplitSink};
 use serde::Deserialize;
 use solana_sdk::pubkey::Pubkey;
-use solana_sdk::signature::Signature;
+use solana_sdk::signature::{Keypair, Signature, Signer};
 use tracing::{debug, info, warn};
-use zeroclaw_solana::context::{AgentMode, TxSendError};
+use zeroclaw_solana::client::SolanaClient;
+use zeroclaw_solana::context::{AGENT_CTX, AgentContext, AgentMode, TxSendError, TxSender};
 
 use crate::AppState;
 
@@ -53,7 +54,22 @@ use super::session::{
     CLOSE_TOO_MANY, ChatRole, MAX_MESSAGE_CONTENT_DEFAULT, PING_INTERVAL, PONG_TIMEOUT,
     PlexChatSession,
 };
+use super::tx_sender::PlexChatTxSender;
 use super::wire::{ClientMsg, ServerMsg};
+
+/// Default agent fee (in SOL) prepended to user-signed transactions when
+/// the per-tool override does not specify one. Mirrors SPEC §10.2's
+/// `AGENT_FEE_SOL` knob; the config-bound override lands in PR 7+.
+const DEFAULT_AGENT_FEE_SOL: f64 = 0.001;
+
+/// Default Solana RPC URL used when [`PlexChatConfig::solana_rpc_url`] is
+/// unset. The PR 6 `AGENT_CTX` wiring needs *some* `SolanaClient` so tools
+/// invoked inside `AGENT_CTX::scope` can call `current_context()`; production
+/// deployments are expected to configure this through the `[plexchat]`
+/// section. The placeholder URL is intentionally unreachable so a tool that
+/// actually issues an RPC against an unconfigured gateway fails fast rather
+/// than silently routing to mainnet.
+const DEFAULT_RPC_URL: &str = "http://127.0.0.1:8899";
 
 /// Stub agent name used by PR 2's echo reply. Replaced by the real
 /// configured assistant_name in PR 3 when the LLM agent loop wires in.
@@ -131,6 +147,104 @@ pub async fn handle_ws_plexchat(
         .into_response()
 }
 
+/// Read the configured PlexChat agent mode (defaulting to `Public`).
+///
+/// Split out so the handler unit tests can exercise the parsing without
+/// pulling the whole handshake apart. Recognized values are `"public"`
+/// and `"autonomous"` (case-insensitive); anything else logs a warning
+/// and falls back to `Public` so a misconfigured deployment keeps
+/// running with the safer mode.
+fn agent_mode_from_config(raw: Option<&str>) -> AgentMode {
+    match raw.map(|s| s.trim().to_ascii_lowercase()) {
+        Some(s) if s == "autonomous" => AgentMode::Autonomous,
+        Some(s) if s == "public" => AgentMode::Public,
+        Some(other) if !other.is_empty() => {
+            warn!(
+                value = other,
+                "PlexChat agent_mode value not recognised; defaulting to public"
+            );
+            AgentMode::Public
+        }
+        _ => AgentMode::Public,
+    }
+}
+
+/// Snapshot of `[plexchat]` config + decoded materials needed to build an
+/// `AgentContext` per turn. Decoded once per session in `handle_socket`
+/// so a malformed config surfaces in a single warn line instead of being
+/// re-logged on every inbound message.
+struct SessionConfig {
+    mode: AgentMode,
+    rpc_url: String,
+    /// Optional decoded agent keypair. `None` when the config either does
+    /// not provide one or the value fails to decode.
+    agent_keypair: Option<Arc<Keypair>>,
+    /// Pubkey corresponding to `agent_keypair`. `Pubkey::default()` (all
+    /// zeros) when no keypair is configured — public-mode tools that need
+    /// the agent identity will surface a `Generic` error instead of
+    /// signing with a zero key.
+    agent_pubkey: Pubkey,
+    /// Optional autonomous-mode owner pubkey. Parsed when the config
+    /// supplies a base58 string; ignored on parse failure with a warning.
+    bootstrap_wallet: Option<Pubkey>,
+}
+
+impl SessionConfig {
+    /// Pull the live config snapshot, decoding the agent keypair eagerly.
+    /// All failures are non-fatal: tools that depend on the missing piece
+    /// surface their own `Generic` error via `current_context()`.
+    fn from_state(state: &AppState) -> Self {
+        let plex = state.config.lock().plexchat.clone();
+        let mode = agent_mode_from_config(plex.agent_mode.as_deref());
+        let rpc_url = plex
+            .solana_rpc_url
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_RPC_URL.to_string());
+
+        let (agent_keypair, agent_pubkey) = match plex.agent_keypair.as_deref() {
+            Some(raw) => match zeroclaw_solana::keypair::decode(raw) {
+                Ok(kp) => {
+                    let pk = kp.pubkey();
+                    (Some(Arc::new(kp)), pk)
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "PlexChat agent_keypair failed to decode; AGENT_CTX will be built without an agent identity"
+                    );
+                    (None, Pubkey::default())
+                }
+            },
+            None => (None, Pubkey::default()),
+        };
+
+        let bootstrap_wallet = plex
+            .bootstrap_wallet
+            .as_deref()
+            .and_then(|raw| {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    return None;
+                }
+                match Pubkey::from_str(trimmed) {
+                    Ok(pk) => Some(pk),
+                    Err(e) => {
+                        warn!(error = %e, value = trimmed, "PlexChat bootstrap_wallet is not a valid pubkey; ignoring");
+                        None
+                    }
+                }
+            });
+
+        SessionConfig {
+            mode,
+            rpc_url,
+            agent_keypair,
+            agent_pubkey,
+            bootstrap_wallet,
+        }
+    }
+}
+
 /// Drive a single PlexChat connection from upgrade to close.
 async fn handle_socket(socket: WebSocket, state: AppState) {
     let active = state.plexchat_active.clone();
@@ -145,15 +259,19 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         return;
     }
 
-    // PR 3 will read the agent mode from `state.config.lock().plexchat`
-    // (`PlexChatConfig::agent_mode`). For now every connection runs in
-    // Public mode — autonomous-mode owner verification ships with the
-    // tool-dispatch wiring.
-    let session = PlexChatSession::new(AgentMode::Public);
+    // ── Session config snapshot ───────────────────────────────────────
+    // Read `[plexchat]` once per session so a config reload in flight
+    // does not flap the agent mode mid-conversation. PR 7+ may resnapshot
+    // on `wallet_connect` to honour live `agent_asset_address` updates.
+    let cfg = Arc::new(SessionConfig::from_state(&state));
+    let solana = Arc::new(SolanaClient::new(cfg.rpc_url.clone()));
+
+    let session = PlexChatSession::new(cfg.mode);
     let jid = session.jid.clone();
 
     info!(
         jid = %jid,
+        mode = ?cfg.mode,
         active = active.load(Ordering::Acquire),
         "PlexChat connection accepted"
     );
@@ -161,7 +279,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     // Run the connection until it closes for any reason. Cleanup runs
     // unconditionally afterwards so we cannot leak the active-counter
     // slot or leave pending transactions awaited forever.
-    drive_connection(socket, session.clone()).await;
+    drive_connection(socket, session.clone(), cfg, solana).await;
 
     session.abort.cancel();
     session.reject_all_pending();
@@ -196,12 +314,37 @@ fn now_epoch_ms() -> i64 {
 }
 
 /// Drive the receive loop, ping/pong tracker, and outbound queue.
-async fn drive_connection(socket: WebSocket, session: Arc<PlexChatSession>) {
+async fn drive_connection(
+    socket: WebSocket,
+    session: Arc<PlexChatSession>,
+    cfg: Arc<SessionConfig>,
+    solana: Arc<SolanaClient>,
+) {
     let (sender, mut receiver) = socket.split();
 
     // Outbound queue lets future tasks (ping loop, agent dispatch) all
     // funnel through a single writer without competing for the sink lock.
     let (tx_out, mut rx_out) = tokio::sync::mpsc::channel::<Message>(32);
+
+    // Secondary queue used by `PlexChatTxSender`. Tools that need to
+    // prompt the user wallet emit `ServerMsg::Transaction` frames; the
+    // small forwarder task below translates each one to a JSON text
+    // frame so the writer task above stays a pure `Message` consumer.
+    // Bounded at 32 to mirror the writer queue.
+    let (server_tx, mut server_rx) = tokio::sync::mpsc::channel::<ServerMsg>(32);
+    {
+        let tx_out_clone = tx_out.clone();
+        tokio::spawn(async move {
+            while let Some(msg) = server_rx.recv().await {
+                let Ok(json) = serde_json::to_string(&msg) else {
+                    continue;
+                };
+                if tx_out_clone.send(Message::Text(json.into())).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
 
     // Spawn the outbound writer.
     let writer_handle = tokio::spawn(async move {
@@ -278,7 +421,16 @@ async fn drive_connection(socket: WebSocket, session: Arc<PlexChatSession>) {
                 let Some(frame) = frame else { break };
                 match frame {
                     Ok(Message::Text(text)) => {
-                        if !handle_text_frame(&session, &tx_out, text.as_str()).await {
+                        if !handle_text_frame(
+                            &session,
+                            &tx_out,
+                            &server_tx,
+                            &cfg,
+                            &solana,
+                            text.as_str(),
+                        )
+                        .await
+                        {
                             break;
                         }
                     }
@@ -310,7 +462,14 @@ async fn drive_connection(socket: WebSocket, session: Arc<PlexChatSession>) {
     // Cancel before awaiting the writer so the ping task drops its
     // outbound handle — otherwise the writer loop would block forever
     // on a `recv` whose only remaining sender is held by the ping task.
+    //
+    // `server_tx` must be dropped *before* awaiting the writer too:
+    // the forwarder task above holds a `tx_out` clone, and as long as
+    // the matching `server_rx` has senders, the forwarder loop survives
+    // and keeps that clone alive — which would keep the writer waiting
+    // on `rx_out.recv()` forever.
     session.abort.cancel();
+    drop(server_tx);
     drop(tx_out);
     let _ = writer_handle.await;
 }
@@ -320,6 +479,9 @@ async fn drive_connection(socket: WebSocket, session: Arc<PlexChatSession>) {
 async fn handle_text_frame(
     session: &Arc<PlexChatSession>,
     tx_out: &tokio::sync::mpsc::Sender<Message>,
+    server_tx: &tokio::sync::mpsc::Sender<ServerMsg>,
+    cfg: &Arc<SessionConfig>,
+    solana: &Arc<SolanaClient>,
     text: &str,
 ) -> bool {
     match serde_json::from_str::<ClientMsg>(text) {
@@ -329,7 +491,21 @@ async fn handle_text_frame(
                 received = client_msg_kind(&msg),
                 "PlexChat client message received"
             );
-            dispatch_client_msg(session, tx_out, msg).await
+            // ── AGENT_CTX scope ───────────────────────────────────────
+            // Build a fresh `AgentContext` from the live session + config
+            // and scope the dispatch inside `AGENT_CTX::scope`. Tools
+            // invoked anywhere downstream — including the future
+            // LLM-driven agent loop — can reach for `current_context()`
+            // and find a populated context that mirrors SPEC Appendix B.
+            //
+            // PR 6 still ships the stub-echo dispatch from PR 2 so the
+            // contract surface stays unchanged for the existing UI
+            // smoke tests. Full LLM-driven dispatch with tool calls
+            // lands when `zeroclaw-runtime` integration is wired.
+            let ctx = build_agent_context(session, cfg, solana, server_tx);
+            AGENT_CTX
+                .scope(ctx, dispatch_client_msg(session, tx_out, msg))
+                .await
         }
         Err(parse_err) => {
             let reply = ServerMsg::Error {
@@ -341,6 +517,89 @@ async fn handle_text_frame(
     }
 }
 
+/// Build a fresh `AgentContext` for one inbound `ClientMsg`.
+///
+/// The context snapshots the session-mutable fields (`wallet_address`)
+/// at message time; longer-lived fields (`agent_pubkey`, mode, RPC
+/// client) come from the per-session [`SessionConfig`] decoded once in
+/// `handle_socket`. The persisted agent identity (`agent_asset_address`,
+/// `agent_token_mint`) is read from `agent-state.json` via
+/// [`zeroclaw_solana::state::load_at`] — best-effort, errors are logged
+/// once and the corresponding fields default to `None` so a missing
+/// state file doesn't break message handling.
+///
+/// Public mode wires a [`PlexChatTxSender`] keyed to the live session +
+/// `server_tx` queue. Autonomous mode passes `None`, signalling
+/// `submit_or_send` to sign with `agent_keypair` directly.
+fn build_agent_context(
+    session: &Arc<PlexChatSession>,
+    cfg: &Arc<SessionConfig>,
+    solana: &Arc<SolanaClient>,
+    server_tx: &tokio::sync::mpsc::Sender<ServerMsg>,
+) -> AgentContext {
+    let wallet_address = *session.wallet_address.lock();
+
+    // Public mode wires a real `TxSender`; autonomous mode is `None`.
+    let tx_sender: Option<Arc<dyn TxSender>> = match cfg.mode {
+        AgentMode::Public => Some(Arc::new(PlexChatTxSender::new(
+            Arc::downgrade(session),
+            server_tx.clone(),
+        ))),
+        AgentMode::Autonomous => None,
+    };
+
+    // Best-effort owner resolution for PR 6: autonomous mode falls back
+    // to `bootstrap_wallet` directly so launch / register flows have
+    // *something* to compare against. Public mode leaves it `None` —
+    // the full SPEC §3.4 owner cache lookup wires in a follow-up PR.
+    let owner_wallet = match cfg.mode {
+        AgentMode::Public => None,
+        AgentMode::Autonomous => cfg.bootstrap_wallet,
+    };
+
+    // Pull persisted agent identity from `agent-state.json`. Failures
+    // here (missing workspace, parse error) are logged at `debug` so
+    // first-boot deployments don't spam warn lines.
+    let (agent_asset_address, agent_token_mint) =
+        match zeroclaw_solana::state::workspace_state_path() {
+            Ok(path) => match zeroclaw_solana::state::load_at(&path) {
+                Ok(state) => {
+                    let asset = state
+                        .agent_asset_address
+                        .as_deref()
+                        .and_then(|s| Pubkey::from_str(s).ok());
+                    let mint = state
+                        .agent_token_mint
+                        .as_deref()
+                        .and_then(|s| Pubkey::from_str(s).ok());
+                    (asset, mint)
+                }
+                Err(e) => {
+                    debug!(error = %e, "PlexChat agent-state.json failed to load");
+                    (None, None)
+                }
+            },
+            Err(e) => {
+                debug!(error = %e, "PlexChat workspace root not located; agent-state.json skipped");
+                (None, None)
+            }
+        };
+
+    AgentContext {
+        wallet_address,
+        agent_mode: cfg.mode,
+        agent_pubkey: cfg.agent_pubkey,
+        agent_keypair: cfg.agent_keypair.clone(),
+        agent_asset_address,
+        agent_token_mint,
+        agent_fee_sol: DEFAULT_AGENT_FEE_SOL,
+        token_override: None,
+        owner_wallet,
+        tx_sender,
+        solana: solana.clone(),
+    }
+}
+
 /// SPEC §6.3 client-message dispatch.
 ///
 /// Each variant returns `true` to keep the receive loop alive. None of the
@@ -349,6 +608,10 @@ async fn handle_text_frame(
 /// retry or disconnect. Returning `false` from this function therefore only
 /// happens when the outbound writer is gone and we cannot deliver any
 /// further frames at all.
+///
+/// Runs inside `AGENT_CTX::scope` set up by [`handle_text_frame`]: any
+/// tool dispatched from this future (or its descendants) can reach
+/// `current_context()` and find a populated [`AgentContext`].
 async fn dispatch_client_msg(
     session: &Arc<PlexChatSession>,
     tx_out: &tokio::sync::mpsc::Sender<Message>,
@@ -1386,5 +1649,172 @@ mod tests {
         drop(held);
         server.abort();
         let _ = server.await;
+    }
+
+    // ── PR 6 AGENT_CTX wiring tests ──────────────────────────────────
+
+    /// `agent_mode_from_config` accepts the SPEC-defined values
+    /// case-insensitively, defaults to `Public` on missing/empty/unknown,
+    /// and trims surrounding whitespace.
+    #[test]
+    fn agent_mode_from_config_recognises_spec_values() {
+        assert_eq!(agent_mode_from_config(None), AgentMode::Public);
+        assert_eq!(agent_mode_from_config(Some("")), AgentMode::Public);
+        assert_eq!(agent_mode_from_config(Some("public")), AgentMode::Public);
+        assert_eq!(agent_mode_from_config(Some("Public")), AgentMode::Public);
+        assert_eq!(
+            agent_mode_from_config(Some("autonomous")),
+            AgentMode::Autonomous
+        );
+        assert_eq!(
+            agent_mode_from_config(Some("AUTONOMOUS")),
+            AgentMode::Autonomous
+        );
+        // Whitespace is trimmed; unknown values fall back to Public.
+        assert_eq!(
+            agent_mode_from_config(Some("  autonomous  ")),
+            AgentMode::Autonomous
+        );
+        assert_eq!(agent_mode_from_config(Some("nonsense")), AgentMode::Public);
+    }
+
+    /// PR 6 plumbing acceptance test: scope an `AgentContext` exactly the
+    /// way `handle_text_frame` does, then drive a public-level shared
+    /// tool (`BuybackToken`) through `tool.execute(args)` inside the
+    /// scope. The tool's body calls `current_context()` and uses the
+    /// returned `agent_token_mint` / `token_override` to compute the
+    /// swap target. If the scope plumbing regressed, the call would
+    /// surface `GENERIC: no agent context` instead of the configured
+    /// `NO_TOKEN` error — that distinct code is what this test asserts.
+    ///
+    /// We deliberately do NOT exercise the full WS round-trip here. The
+    /// goal is to prove that `AGENT_CTX::scope` wraps tool execution
+    /// under the same `tokio::task_local` slot a future LLM-driven
+    /// dispatch would see. We pick `BuybackToken` (and not `Sleep`)
+    /// because it is one of the simplest tools whose body actually
+    /// reaches `current_context()` — `Sleep` ignores the slot entirely
+    /// and would not differentiate a working scope from a missing one.
+    #[tokio::test]
+    async fn agent_ctx_scope_wraps_tool_execute() {
+        use zeroclaw_api::tool::Tool;
+        use zeroclaw_solana::client::SolanaClient;
+        use zeroclaw_solana::context::{AGENT_CTX, AgentContext, AgentMode, current_context};
+        use zeroclaw_tools::solana::shared::buyback_token::BuybackToken;
+
+        // Build a session by hand — same constructor `handle_socket` uses.
+        let session = PlexChatSession::new(AgentMode::Public);
+
+        // Build the AgentContext directly, mirroring `build_agent_context`
+        // for a public-mode session. We leave `agent_token_mint` and
+        // `token_override` both `None` so BuybackToken short-circuits
+        // with `NO_TOKEN` rather than attempting any RPC work.
+        let ctx = AgentContext {
+            wallet_address: *session.wallet_address.lock(),
+            agent_mode: AgentMode::Public,
+            agent_pubkey: solana_sdk::pubkey::Pubkey::new_from_array([0u8; 32]),
+            agent_keypair: None,
+            agent_asset_address: None,
+            agent_token_mint: None,
+            agent_fee_sol: super::DEFAULT_AGENT_FEE_SOL,
+            token_override: None,
+            owner_wallet: None,
+            tx_sender: None,
+            solana: Arc::new(SolanaClient::new("http://example.invalid")),
+        };
+
+        // Outside any scope `current_context()` errors. This sentinel
+        // proves the scope itself is the load-bearing plumbing — without
+        // it, the assertion below would also pass trivially.
+        assert!(current_context().is_err());
+
+        AGENT_CTX
+            .scope(ctx, async move {
+                // 1. `current_context()` returns the populated context
+                //    inside the scope.
+                let inner = current_context().expect("AGENT_CTX must be populated inside scope");
+                assert_eq!(inner.agent_mode, AgentMode::Public);
+                assert_eq!(inner.agent_fee_sol, super::DEFAULT_AGENT_FEE_SOL);
+
+                // 2. `tool.execute(args)` invoked inside the scope reaches
+                //    `current_context()` successfully and proceeds to the
+                //    tool's own validation. We pass valid arguments so
+                //    the tool short-circuits on the missing token mint
+                //    rather than on argument parsing.
+                let r = BuybackToken
+                    .execute(serde_json::json!({ "amount_sol": 0.5 }))
+                    .await
+                    .unwrap();
+                assert!(!r.success);
+                // Distinct from "GENERIC: no agent context …" — that's
+                // the failure mode we'd see if scope plumbing regressed.
+                assert!(
+                    r.output.contains("NO_TOKEN"),
+                    "expected NO_TOKEN inside scope, got: {}",
+                    r.output
+                );
+                assert!(
+                    !r.output.contains("AGENT_CTX"),
+                    "tool body must see populated context, got: {}",
+                    r.output
+                );
+            })
+            .await;
+    }
+
+    /// `build_agent_context` populates the SPEC Appendix B fields we
+    /// expect for a public-mode session: mode, agent_pubkey from the
+    /// session config, a real `TxSender`, and `owner_wallet = None`
+    /// (PR 6 leaves the SPEC §3.4 owner-cache lookup deferred).
+    #[tokio::test]
+    async fn build_agent_context_public_mode_wires_tx_sender() {
+        let session = PlexChatSession::new(AgentMode::Public);
+        let cfg = Arc::new(SessionConfig {
+            mode: AgentMode::Public,
+            rpc_url: "http://127.0.0.1:8899".to_string(),
+            agent_keypair: None,
+            agent_pubkey: solana_sdk::pubkey::Pubkey::new_from_array([7u8; 32]),
+            bootstrap_wallet: None,
+        });
+        let solana = Arc::new(SolanaClient::new("http://127.0.0.1:8899"));
+        let (server_tx, _server_rx) = tokio::sync::mpsc::channel::<ServerMsg>(8);
+
+        let ctx = build_agent_context(&session, &cfg, &solana, &server_tx);
+
+        assert_eq!(ctx.agent_mode, AgentMode::Public);
+        assert_eq!(
+            ctx.agent_pubkey,
+            solana_sdk::pubkey::Pubkey::new_from_array([7u8; 32])
+        );
+        assert!(ctx.tx_sender.is_some(), "public mode wires a TxSender");
+        assert!(
+            ctx.owner_wallet.is_none(),
+            "PR 6 leaves owner_wallet unresolved in public mode"
+        );
+        assert!(ctx.agent_keypair.is_none());
+    }
+
+    /// Autonomous mode passes `tx_sender = None` (the agent signs
+    /// directly) and propagates `bootstrap_wallet` to `owner_wallet` so
+    /// the SPEC §3.4 first-boot flow has *something* to compare against
+    /// before `register-agent` writes a real asset address.
+    #[tokio::test]
+    async fn build_agent_context_autonomous_mode_uses_bootstrap_wallet() {
+        let session = PlexChatSession::new(AgentMode::Autonomous);
+        let bootstrap = solana_sdk::pubkey::Pubkey::new_from_array([9u8; 32]);
+        let cfg = Arc::new(SessionConfig {
+            mode: AgentMode::Autonomous,
+            rpc_url: "http://127.0.0.1:8899".to_string(),
+            agent_keypair: None,
+            agent_pubkey: solana_sdk::pubkey::Pubkey::new_from_array([8u8; 32]),
+            bootstrap_wallet: Some(bootstrap),
+        });
+        let solana = Arc::new(SolanaClient::new("http://127.0.0.1:8899"));
+        let (server_tx, _server_rx) = tokio::sync::mpsc::channel::<ServerMsg>(8);
+
+        let ctx = build_agent_context(&session, &cfg, &solana, &server_tx);
+
+        assert_eq!(ctx.agent_mode, AgentMode::Autonomous);
+        assert!(ctx.tx_sender.is_none(), "autonomous mode signs agent-side");
+        assert_eq!(ctx.owner_wallet, Some(bootstrap));
     }
 }
