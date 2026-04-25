@@ -7,4 +7,5 @@
 pub mod auth;
 pub mod handler;
 pub mod session;
+pub mod tx_sender;
 pub mod wire;
