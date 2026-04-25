@@ -23,6 +23,7 @@ pub mod sse;
 pub mod static_files;
 pub mod tls;
 pub mod ws;
+pub mod ws_plexchat;
 
 use anyhow::{Context, Result};
 use axum::{
