@@ -17,6 +17,9 @@ solana-sdk = { workspace = true, features = ["full"] }
 solana-client.workspace = true
 solana-commitment-config = { version = "3", default-features = false }
 solana-transaction-status.workspace = true
+solana-system-interface = { version = "3", default-features = false, features = ["bincode"] }
+spl-associated-token-account.workspace = true
+spl-token.workspace = true
 anyhow = "1.0"
 async-trait = "0.1"
 base64 = "0.22"

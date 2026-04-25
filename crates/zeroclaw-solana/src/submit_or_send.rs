@@ -98,7 +98,7 @@ pub async fn submit_or_send(
     ctx: &AgentContext,
     mut ixs: Vec<Instruction>,
     opts: SubmitOpts,
-    agent_signers: &[&dyn Signer],
+    agent_signers: &[&(dyn Signer + Sync)],
 ) -> Result<Signature, ToolError> {
     // Public mode: wallet bridge.
     if let (Some(tx_sender), Some(user)) = (ctx.tx_sender.as_ref(), ctx.wallet_address) {

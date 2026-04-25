@@ -5,7 +5,7 @@
 //! - [`shared`] — tools available in both `AGENT_MODE=public` and
 //!   `AGENT_MODE=autonomous`.
 //! - [`public`] — tools only available in public mode (`transfer-sol`,
-//!   `transfer-token`). Empty in PR 3 — populated by PR 4.
+//!   `transfer-token`).
 //!
 //! Tool registries are composed by [`public_agent_tools`] and
 //! [`autonomous_agent_tools`].
@@ -17,9 +17,6 @@ use std::sync::Arc;
 use zeroclaw_api::tool::Tool;
 
 /// Public-mode tool list: shared tools + public-only transfer tools.
-///
-/// In PR 3, public-only tools are not yet implemented, so this currently
-/// returns the same set as [`autonomous_agent_tools`].
 pub fn public_agent_tools() -> Vec<Arc<dyn Tool>> {
     let mut tools = shared::shared_tools();
     tools.extend(public::public_tools());
@@ -87,6 +84,29 @@ mod tests {
         ];
         for e in &expected {
             assert!(names.iter().any(|n| n == e), "missing {e}");
+        }
+    }
+
+    #[test]
+    fn public_only_tools_include_transfer_tools() {
+        let public_names: Vec<String> = public::public_tools()
+            .iter()
+            .map(|t| t.name().to_string())
+            .collect();
+        for e in ["transfer-sol", "transfer-token"] {
+            assert!(public_names.iter().any(|n| n == e), "missing public tool {e}");
+        }
+    }
+
+    #[test]
+    fn public_tool_names_are_kebab_case() {
+        for t in public::public_tools() {
+            let name = t.name();
+            assert!(
+                name.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+                "tool name must be kebab-case: {name}"
+            );
         }
     }
 }
