@@ -125,11 +125,10 @@ pub async fn submit_or_send(
         let mut tx = Transaction::new_with_payer(&ixs, Some(&user));
         tx.message.recent_blockhash = blockhash;
 
-        let serialized =
-            bincode::serialize(&tx).map_err(|e| ToolError {
-                code: ToolErrorCode::Generic,
-                message: truncate_llm_message(format!("transaction serialization failed: {e}")),
-            })?;
+        let serialized = bincode::serialize(&tx).map_err(|e| ToolError {
+            code: ToolErrorCode::Generic,
+            message: truncate_llm_message(format!("transaction serialization failed: {e}")),
+        })?;
         let b64 = base64::engine::general_purpose::STANDARD.encode(serialized);
 
         return tx_sender
@@ -258,11 +257,7 @@ mod tests {
         }
     }
 
-    fn ctx_public(
-        sender: Arc<dyn TxSender>,
-        user: Pubkey,
-        agent_fee_sol: f64,
-    ) -> AgentContext {
+    fn ctx_public(sender: Arc<dyn TxSender>, user: Pubkey, agent_fee_sol: f64) -> AgentContext {
         AgentContext {
             wallet_address: Some(user),
             agent_mode: AgentMode::Public,
@@ -293,7 +288,9 @@ mod tests {
     }
 
     fn deserialize_tx(b64: &str) -> Transaction {
-        let bytes = base64::engine::general_purpose::STANDARD.decode(b64).unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .unwrap();
         bincode::deserialize::<Transaction>(&bytes).unwrap()
     }
 
@@ -349,11 +346,14 @@ mod tests {
         // Expected: get_latest_blockhash will fail (no real RPC). We only
         // care about routing, so we expect an Err but verify it routed via
         // the public path by way of the error message.
-        let err = submit_or_send(&ctx, vec![original], opts, &[]).await.unwrap_err();
+        let err = submit_or_send(&ctx, vec![original], opts, &[])
+            .await
+            .unwrap_err();
         // The error must be the classified blockhash-fetch failure, not
         // the "no signers in autonomous mode" guard.
         assert!(
-            err.message.contains("get_latest_blockhash") || err.code == ToolErrorCode::RpcFailure
+            err.message.contains("get_latest_blockhash")
+                || err.code == ToolErrorCode::RpcFailure
                 || err.code == ToolErrorCode::Timeout,
             "expected RPC error from public path, got {err:?}"
         );

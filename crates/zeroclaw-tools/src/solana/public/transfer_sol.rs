@@ -67,8 +67,14 @@ impl Tool for TransferSol {
             }
         };
 
-        if !(parsed.amount_sol > 0.0) {
-            // Catches NaN, negative, and zero.
+        // Catches NaN, negative, and zero. Using `partial_cmp` per clippy's
+        // `neg_cmp_op_on_partial_ord` lint — `!(x > 0.0)` would silently
+        // accept NaN.
+        let amount_ok = matches!(
+            parsed.amount_sol.partial_cmp(&0.0),
+            Some(std::cmp::Ordering::Greater)
+        );
+        if !amount_ok {
             let r: ToolResult<()> = err(
                 ToolErrorCode::InvalidInput,
                 "amount_sol must be a positive number",

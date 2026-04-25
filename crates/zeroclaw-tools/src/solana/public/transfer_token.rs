@@ -198,7 +198,10 @@ impl Tool for TransferToken {
         ixs.push(transfer_ix);
 
         let opts = SubmitOpts {
-            message: Some(format!("Transfer {} tokens of {}", parsed.amount, parsed.mint)),
+            message: Some(format!(
+                "Transfer {} tokens of {}",
+                parsed.amount, parsed.mint
+            )),
             ..Default::default()
         };
         match submit_or_send(&ctx, ixs, opts, &[]).await {
@@ -237,12 +240,11 @@ async fn fetch_mint_decimals(
             message: format!("could not load mint {mint}: {raw}"),
         }
     })?;
-    let mint_state = spl_token::state::Mint::unpack(&acct.data).map_err(|e| {
-        zeroclaw_solana::ToolError {
+    let mint_state =
+        spl_token::state::Mint::unpack(&acct.data).map_err(|e| zeroclaw_solana::ToolError {
             code: ToolErrorCode::Integrity,
             message: format!("invalid mint data for {mint}: {e}"),
-        }
-    })?;
+        })?;
     Ok(mint_state.decimals)
 }
 

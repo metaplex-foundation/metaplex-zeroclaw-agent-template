@@ -73,7 +73,7 @@ mod tests {
             .iter()
             .map(|t| t.name().to_string())
             .collect();
-        // Read-only subset only in PR 3; identity/treasury tools land in PR 4+.
+        // PR 3 added the read-only subset; PR 4 added identity stubs.
         let expected = [
             "get-balance",
             "get-token-balances",
@@ -81,6 +81,8 @@ mod tests {
             "get-token-price",
             "get-token-metadata",
             "sleep",
+            "register-agent",
+            "delegate-execution",
         ];
         for e in &expected {
             assert!(names.iter().any(|n| n == e), "missing {e}");
@@ -94,7 +96,10 @@ mod tests {
             .map(|t| t.name().to_string())
             .collect();
         for e in ["transfer-sol", "transfer-token"] {
-            assert!(public_names.iter().any(|n| n == e), "missing public tool {e}");
+            assert!(
+                public_names.iter().any(|n| n == e),
+                "missing public tool {e}"
+            );
         }
     }
 
