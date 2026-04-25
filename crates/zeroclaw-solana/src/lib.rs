@@ -22,6 +22,8 @@ pub mod state;
 pub mod tool_result;
 
 pub use auth::{AuthLevel, default_auth_policy, with_auth};
-pub use context::{AGENT_CTX, AgentContext, AgentMode, TxSendError, TxSendOpts, TxSender, current_context};
+pub use context::{
+    AGENT_CTX, AgentContext, AgentMode, TxSendError, TxSendOpts, TxSender, current_context,
+};
 pub use error_codes::{ToolError, ToolErrorCode, to_tool_error};
 pub use tool_result::{ToolResult, err, info, ok};
