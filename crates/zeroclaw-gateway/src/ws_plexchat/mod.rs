@@ -4,4 +4,5 @@
 //! wire format, session state, and auth gate semantics. Tool dispatch
 //! and LLM streaming wire in PR 3.
 
+pub mod session;
 pub mod wire;
