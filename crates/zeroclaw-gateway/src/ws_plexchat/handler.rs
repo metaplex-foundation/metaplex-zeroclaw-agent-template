@@ -1,6 +1,6 @@
 //! PlexChat WebSocket connection handler (SPEC §6).
 //!
-//! Responsibilities for PR 2 Task 3:
+//! Responsibilities (PR 2 Tasks 3 + 4):
 //!
 //! - Authenticate the upgrade request via `Authorization: Bearer …`,
 //!   `Sec-WebSocket-Protocol: bearer, <token>`, or `?token=…`. Reject with
@@ -11,10 +11,14 @@
 //!   `PLEXCHAT_ACTIVE` counter; exceeding the cap closes with code 4002.
 //!   (PR 2 Task 6 will move this counter onto `AppState`.)
 //! - On accept, install a [`PlexChatSession`], emit
-//!   `ServerMsg::Connected { jid }`, and run a minimal receive loop. Real
-//!   client-message dispatch lands in PR 2 Task 4 — for now any received
-//!   text frame is parsed as `ClientMsg` and replied to with a
-//!   `NOT_IMPLEMENTED` error.
+//!   `ServerMsg::Connected { jid }`, and run the receive loop.
+//! - Dispatch every `ClientMsg` variant per SPEC §6.3:
+//!   `message` (content cap → rate limit → sanitize → history append →
+//!   stubbed agent echo reply; the real LLM agent loop wires in PR 3),
+//!   `wallet_connect` / `wallet_disconnect` (with autonomous-mode owner
+//!   verification stubbed for PR 2 — see TODO in
+//!   [`handle_wallet_connect`]), `tx_result` (with SPEC §6.6 late-ok
+//!   handling), and `tx_error` (with reason sanitization).
 //! - Aliveness: a tokio `interval(PING_INTERVAL)` ping loop tracks the
 //!   last pong instant via an `AtomicI64` (epoch ms). Two consecutive
 //!   missed pongs (no pong within `PONG_TIMEOUT` of the last ping)
@@ -22,6 +26,7 @@
 //! - On close, cancel `session.abort` and reject every pending
 //!   transaction with `Disconnected`.
 
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -36,14 +41,28 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt, stream::SplitSink};
 use serde::Deserialize;
+use solana_sdk::pubkey::Pubkey;
+use solana_sdk::signature::Signature;
 use tracing::{debug, info, warn};
-use zeroclaw_solana::context::AgentMode;
+use zeroclaw_solana::context::{AgentMode, TxSendError};
 
 use crate::AppState;
 
 use super::auth::extract_ws_token;
-use super::session::{CLOSE_TOO_MANY, PING_INTERVAL, PONG_TIMEOUT, PlexChatSession};
+use super::session::{
+    CLOSE_TOO_MANY, ChatRole, MAX_MESSAGE_CONTENT_DEFAULT, PING_INTERVAL, PONG_TIMEOUT,
+    PlexChatSession,
+};
 use super::wire::{ClientMsg, ServerMsg};
+
+/// Stub agent name used by PR 2's echo reply. Replaced by the real
+/// configured assistant_name in PR 3 when the LLM agent loop wires in.
+const STUB_AGENT_NAME: &str = "Agent";
+
+/// SPEC §6.5 reason cap — 200 characters of safe ASCII punctuation.
+const SAFE_REASON_MAX_LEN: usize = 200;
+/// Fallback substituted for missing or non-conforming `tx_error.reason`.
+const SAFE_REASON_FALLBACK: &str = "User rejected or wallet error";
 
 /// SPEC §6.2 subprotocol sentinel — clients send
 /// `Sec-WebSocket-Protocol: bearer, <token>` and the server echoes
@@ -308,19 +327,12 @@ async fn handle_text_frame(
 ) -> bool {
     match serde_json::from_str::<ClientMsg>(text) {
         Ok(msg) => {
-            // PR 2 Task 4 wires the real dispatch. Until then we log the
-            // type and reply with a structured NOT_IMPLEMENTED error so
-            // clients can detect feature gaps without parsing logs.
             debug!(
                 jid = %session.jid,
                 received = client_msg_kind(&msg),
-                "PlexChat client message received (dispatch lands in Task 4)"
+                "PlexChat client message received"
             );
-            let reply = ServerMsg::Error {
-                error: "client message handling lands in Task 4".to_string(),
-                code: Some("NOT_IMPLEMENTED".to_string()),
-            };
-            send_server_msg(tx_out, &reply).await
+            dispatch_client_msg(session, tx_out, msg).await
         }
         Err(parse_err) => {
             let reply = ServerMsg::Error {
@@ -330,6 +342,307 @@ async fn handle_text_frame(
             send_server_msg(tx_out, &reply).await
         }
     }
+}
+
+/// SPEC §6.3 client-message dispatch.
+///
+/// Each variant returns `true` to keep the receive loop alive. None of the
+/// SPEC-defined error paths close the socket — the policy is to surface a
+/// structured `Error { code }` server frame and leave it to the client to
+/// retry or disconnect. Returning `false` from this function therefore only
+/// happens when the outbound writer is gone and we cannot deliver any
+/// further frames at all.
+async fn dispatch_client_msg(
+    session: &Arc<PlexChatSession>,
+    tx_out: &tokio::sync::mpsc::Sender<Message>,
+    msg: ClientMsg,
+) -> bool {
+    match msg {
+        ClientMsg::Message {
+            content,
+            sender_name: _,
+        } => handle_message(session, tx_out, content).await,
+        ClientMsg::WalletConnect { address } => {
+            handle_wallet_connect(session, tx_out, address).await
+        }
+        ClientMsg::WalletDisconnect => handle_wallet_disconnect(session, tx_out).await,
+        ClientMsg::TxResult {
+            correlation_id,
+            signature,
+        } => handle_tx_result(session, tx_out, correlation_id, signature).await,
+        ClientMsg::TxError {
+            correlation_id,
+            reason,
+        } => handle_tx_error(session, tx_out, correlation_id, reason).await,
+    }
+}
+
+/// `message` handler — content cap, rate limit, sanitize, history append,
+/// and a stubbed agent echo reply. The real LLM agent loop wires in PR 3.
+async fn handle_message(
+    session: &Arc<PlexChatSession>,
+    tx_out: &tokio::sync::mpsc::Sender<Message>,
+    content: String,
+) -> bool {
+    // 1. Length cap (SPEC §6.2). Compare bytes — `String::len` is bytes,
+    // and the SPEC's 8000 figure is measured in bytes per the comment in
+    // `session::MAX_MESSAGE_CONTENT_DEFAULT`.
+    if content.len() > MAX_MESSAGE_CONTENT_DEFAULT {
+        let err = ServerMsg::Error {
+            error: format!("message exceeds {MAX_MESSAGE_CONTENT_DEFAULT} chars"),
+            code: Some("MESSAGE_TOO_LONG".to_string()),
+        };
+        return send_server_msg(tx_out, &err).await;
+    }
+
+    // 2. Sliding-window rate limit. Do NOT close the socket — clients are
+    // expected to back off and retry.
+    if !session.check_rate_limit() {
+        let err = ServerMsg::Error {
+            error: "rate limit exceeded".to_string(),
+            code: Some("RATE_LIMIT".to_string()),
+        };
+        return send_server_msg(tx_out, &err).await;
+    }
+
+    // 3. Sanitize before persisting to history (SPEC §6.2 prompt-injection
+    // mitigation surface). The raw inbound bytes never enter chat state.
+    let sanitized = sanitize_content(&content);
+
+    // 4. Append to history as the user turn.
+    session.push_history(ChatRole::User, sanitized.clone());
+
+    // 5. Typing(true) before the agent reply.
+    if !send_server_msg(tx_out, &ServerMsg::Typing { is_typing: true }).await {
+        return false;
+    }
+
+    // 6. Stubbed agent reply for PR 2. PR 3 replaces this with a streaming
+    // call into the agent loop with tools.
+    let reply_content = format!("[stub] echo: {sanitized}");
+    let reply = ServerMsg::Message {
+        sender: STUB_AGENT_NAME.to_string(),
+        content: reply_content.clone(),
+    };
+    if !send_server_msg(tx_out, &reply).await {
+        return false;
+    }
+    session.push_history(ChatRole::Assistant, reply_content);
+
+    // 7. Typing(false) tail-frame so clients can hide the indicator.
+    send_server_msg(tx_out, &ServerMsg::Typing { is_typing: false }).await
+}
+
+/// `wallet_connect` handler — parse base58 pubkey, gate by mode, store on
+/// the session, and emit `wallet_connected`.
+async fn handle_wallet_connect(
+    session: &Arc<PlexChatSession>,
+    tx_out: &tokio::sync::mpsc::Sender<Message>,
+    address: String,
+) -> bool {
+    let pubkey = match Pubkey::from_str(&address) {
+        Ok(pk) => pk,
+        Err(_) => {
+            let err = ServerMsg::Error {
+                error: "wallet address is not valid base58 / 32-byte pubkey".to_string(),
+                code: Some("INVALID_WALLET".to_string()),
+            };
+            return send_server_msg(tx_out, &err).await;
+        }
+    };
+
+    match session.mode {
+        AgentMode::Public => {
+            // Public mode: store the address. PR 3 will compare against an
+            // optionally-configured owner wallet to flip `is_owner_verified`
+            // when it matches; for PR 2 we leave the flag false.
+            *session.wallet_address.lock() = Some(pubkey);
+            *session.is_owner_verified.lock() = false;
+        }
+        AgentMode::Autonomous => {
+            // TODO(PR 3): real owner verification via
+            // `zeroclaw_solana::owner::resolve_owner` against the
+            // configured `agent_asset_address`. For PR 2 we accept any
+            // wallet that parses as a valid pubkey so the wire surface
+            // stays exercisable; the policy gate is intentionally stubbed.
+            *session.wallet_address.lock() = Some(pubkey);
+            *session.is_owner_verified.lock() = true;
+            warn!(
+                jid = %session.jid,
+                "PlexChat autonomous-mode wallet_connect accepted without owner verification (PR 2 stub — real check lands in PR 3)"
+            );
+        }
+    }
+
+    let connected = ServerMsg::WalletConnected { address };
+    send_server_msg(tx_out, &connected).await
+}
+
+/// `wallet_disconnect` handler — clear wallet state and emit ack.
+async fn handle_wallet_disconnect(
+    session: &Arc<PlexChatSession>,
+    tx_out: &tokio::sync::mpsc::Sender<Message>,
+) -> bool {
+    *session.wallet_address.lock() = None;
+    *session.is_owner_verified.lock() = false;
+    send_server_msg(tx_out, &ServerMsg::WalletDisconnected).await
+}
+
+/// `tx_result` handler — resolve a pending oneshot or apply SPEC §6.6
+/// late-ok handling. Autonomous mode rejects the message wholesale.
+async fn handle_tx_result(
+    session: &Arc<PlexChatSession>,
+    tx_out: &tokio::sync::mpsc::Sender<Message>,
+    correlation_id: String,
+    signature: String,
+) -> bool {
+    if matches!(session.mode, AgentMode::Autonomous) {
+        let err = ServerMsg::Error {
+            error: "tx_result not allowed in autonomous mode".to_string(),
+            code: Some("INVALID_MODE".to_string()),
+        };
+        return send_server_msg(tx_out, &err).await;
+    }
+
+    // Validate the signature by trying to parse it as a real Solana
+    // `Signature` — this catches both bad-base58 and wrong-length payloads
+    // in one shot, which is simpler than a regex check.
+    let parsed = Signature::from_str(&signature);
+
+    // Pop the pending entry under the lock; act on the responder afterwards.
+    let pending = session.pending_txs.lock().remove(&correlation_id);
+
+    match (pending, parsed) {
+        (Some(entry), Ok(sig)) => {
+            // Resolve the awaiting tool/responder with the parsed signature.
+            let _ = entry.responder.send(Ok(sig));
+            true
+        }
+        (Some(entry), Err(_)) => {
+            // Plan-pragmatic choice (Task 4 doc): drop the entry + reject
+            // the responder so the awaiting caller can surface a sane
+            // error, then notify the client.
+            let _ = entry
+                .responder
+                .send(Err(TxSendError::Rejected("invalid signature".to_string())));
+            let err = ServerMsg::Error {
+                error: "signature is not valid base58 / 64-byte signature".to_string(),
+                code: Some("INVALID_SIGNATURE".to_string()),
+            };
+            send_server_msg(tx_out, &err).await
+        }
+        (None, Ok(_)) => {
+            // SPEC §6.6 late-ok handling: a well-formed signature for a
+            // correlation we no longer track (e.g. timed out, disconnected
+            // and reconnected) is logged and silently accepted so the user
+            // does not see a confusing error after a successful sign.
+            info!(
+                jid = %session.jid,
+                correlation_id = %correlation_id,
+                "[late-ok] tx_result for unknown correlation_id"
+            );
+            true
+        }
+        (None, Err(_)) => {
+            let err = ServerMsg::Error {
+                error: "unknown correlation_id".to_string(),
+                code: Some("UNKNOWN_CORRELATION".to_string()),
+            };
+            send_server_msg(tx_out, &err).await
+        }
+    }
+}
+
+/// `tx_error` handler — sanitize the supplied reason, resolve a pending
+/// oneshot with `TxSendError::Rejected`, or surface UNKNOWN_CORRELATION.
+async fn handle_tx_error(
+    session: &Arc<PlexChatSession>,
+    tx_out: &tokio::sync::mpsc::Sender<Message>,
+    correlation_id: String,
+    reason: Option<String>,
+) -> bool {
+    if matches!(session.mode, AgentMode::Autonomous) {
+        let err = ServerMsg::Error {
+            error: "tx_error not allowed in autonomous mode".to_string(),
+            code: Some("INVALID_MODE".to_string()),
+        };
+        return send_server_msg(tx_out, &err).await;
+    }
+
+    let sanitized_reason = sanitize_reason(reason.as_deref());
+
+    let pending = session.pending_txs.lock().remove(&correlation_id);
+    match pending {
+        Some(entry) => {
+            let _ = entry
+                .responder
+                .send(Err(TxSendError::Rejected(sanitized_reason)));
+            true
+        }
+        None => {
+            let err = ServerMsg::Error {
+                error: "unknown correlation_id".to_string(),
+                code: Some("UNKNOWN_CORRELATION".to_string()),
+            };
+            send_server_msg(tx_out, &err).await
+        }
+    }
+}
+
+/// Strip the four characters used by prompt-injection vectors (CR, LF,
+/// `[`, `]`) from `s`. SPEC §6.2 calls these out specifically because
+/// they are the building blocks of the `[USER]:` / `[ASSISTANT]:` style
+/// role-spoof attacks against the agent prompt.
+pub(crate) fn sanitize_content(s: &str) -> String {
+    s.chars()
+        .filter(|c| !matches!(c, '\r' | '\n' | '[' | ']'))
+        .collect()
+}
+
+/// Validate `reason` against SPEC §6.5's safe-reason character class
+/// (`[\w\s.,:;'"()?!\-]{0,200}`) and substitute a fallback string when
+/// the input is missing, oversize, or contains forbidden characters.
+///
+/// Implemented without `regex` because the rule is a simple per-character
+/// allowlist plus a length cap, both of which are trivial to express with
+/// `char::is_alphanumeric` + a literal punctuation set.
+pub(crate) fn sanitize_reason(reason: Option<&str>) -> String {
+    let Some(input) = reason else {
+        return SAFE_REASON_FALLBACK.to_string();
+    };
+    if input.is_empty() {
+        return SAFE_REASON_FALLBACK.to_string();
+    }
+    if input.chars().count() > SAFE_REASON_MAX_LEN {
+        return SAFE_REASON_FALLBACK.to_string();
+    }
+    if !input.chars().all(is_safe_reason_char) {
+        return SAFE_REASON_FALLBACK.to_string();
+    }
+    input.to_string()
+}
+
+/// Match the SPEC §6.5 safe-reason character class
+/// `[\w\s.,:;'"()?!\-]`. `\w` is the standard regex shorthand for
+/// `[A-Za-z0-9_]` plus the underscore — Unicode word chars are not
+/// permitted because the LLM is fed this string verbatim and we want a
+/// strict ASCII surface.
+fn is_safe_reason_char(c: char) -> bool {
+    if c.is_ascii_alphanumeric() {
+        return true;
+    }
+    matches!(
+        c,
+        '_' | ' ' | '\t' | '.' | ',' | ':' | ';' | '\'' | '"' | '(' | ')' | '?' | '!' | '-'
+    )
+}
+
+/// Return `true` iff `s` parses as a real Solana `Signature` (base58,
+/// 64-byte payload). Used by handler unit tests; the dispatch path uses
+/// `Signature::from_str` directly so the parsed value can be forwarded.
+#[cfg(test)]
+pub(crate) fn validates_signature(s: &str) -> bool {
+    Signature::from_str(s).is_ok()
 }
 
 /// Serialise a `ServerMsg` and forward it to the writer task. Returns
@@ -524,12 +837,6 @@ mod tests {
     /// `Connected { jid }` frame with a non-empty jid.
     #[tokio::test]
     async fn connected_emitted_on_accept() {
-        // Reset the global counter — other tests may have leaked
-        // increments if they panicked. This is hermetic per
-        // `cargo test --lib` because that runs single-threaded for a
-        // single binary; we still serialise via a guard below.
-        let _g = ActiveCounterGuard::reset();
-
         let app = Router::new()
             .route("/ws/plexchat", get(handle_ws_plexchat))
             .with_state(test_state());
@@ -579,8 +886,16 @@ mod tests {
         assert_eq!(v["type"], "connected");
         assert!(v["jid"].as_str().is_some_and(|s| !s.is_empty()));
 
-        // Counter reflects the open connection.
-        assert_eq!(PLEXCHAT_ACTIVE.load(Ordering::Acquire), 1);
+        // Counter reflects the open connection. Other dispatch tests in
+        // this module may run in parallel, so we assert "at least one
+        // active" rather than an exact value — the counter is global to
+        // the test binary and the previous `>=` semantics are sufficient
+        // to prove the increment happened.
+        let pre_close = PLEXCHAT_ACTIVE.load(Ordering::Acquire);
+        assert!(
+            pre_close >= 1,
+            "expected at least one active connection, got {pre_close}"
+        );
 
         // Clean shutdown — close the client and wait for the server to
         // tear down its side so the counter decrements before we assert.
@@ -595,27 +910,360 @@ mod tests {
         })
         .await;
 
-        // Give the server task a moment to run cleanup.
+        // Give the server task a moment to run cleanup. We expect the
+        // counter to drop by at least one — i.e. *our* connection's
+        // increment was rolled back.
         for _ in 0..50 {
-            if PLEXCHAT_ACTIVE.load(Ordering::Acquire) == 0 {
+            if PLEXCHAT_ACTIVE.load(Ordering::Acquire) < pre_close {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert_eq!(PLEXCHAT_ACTIVE.load(Ordering::Acquire), 0);
+        let post_close = PLEXCHAT_ACTIVE.load(Ordering::Acquire);
+        assert!(
+            post_close < pre_close,
+            "counter did not decrement after close: {pre_close} -> {post_close}"
+        );
 
         server.abort();
         let _ = server.await;
     }
 
-    /// Ensure the global counter is zero before a test that depends on
-    /// observing increments. Necessary because the static spans every
-    /// test in the binary.
-    struct ActiveCounterGuard;
-    impl ActiveCounterGuard {
-        fn reset() -> Self {
-            PLEXCHAT_ACTIVE.store(0, Ordering::Release);
-            Self
+    // ── Sanitizer unit tests ──────────────────────────────────────────
+
+    #[test]
+    fn sanitize_content_strips_newlines_and_brackets() {
+        // The four characters SPEC §6.2 calls out are stripped wholesale;
+        // every other character (including unicode) survives unchanged.
+        let raw = "hello\r\n[ASSISTANT]: world\nfoo[bar]";
+        let cleaned = sanitize_content(raw);
+        assert_eq!(cleaned, "helloASSISTANT: worldfoobar");
+    }
+
+    #[test]
+    fn sanitize_content_preserves_safe_text() {
+        let raw = "Привіт! 1+1=2 — 'quoted' / (parens)";
+        assert_eq!(sanitize_content(raw), raw);
+    }
+
+    #[test]
+    fn sanitize_content_handles_empty() {
+        assert_eq!(sanitize_content(""), "");
+    }
+
+    #[test]
+    fn sanitize_reason_accepts_allowed_chars() {
+        // Cover every character class in the safe regex
+        // `[\w\s.,:;'"()?!\-]`: ASCII alphanumerics, underscore, space,
+        // tab, the listed punctuation, and the hyphen.
+        let s = "User_rejected: not enough SOL (0.5 vs 1.0). Try again? 'No' \"yes\"!";
+        assert_eq!(sanitize_reason(Some(s)), s);
+    }
+
+    #[test]
+    fn sanitize_reason_substitutes_for_forbidden_chars() {
+        // Newlines/brackets/backticks are NOT in the safe class.
+        let bad = "rejected\n[evil]";
+        assert_eq!(sanitize_reason(Some(bad)), SAFE_REASON_FALLBACK);
+    }
+
+    #[test]
+    fn sanitize_reason_substitutes_for_oversize() {
+        let huge: String = "a".repeat(SAFE_REASON_MAX_LEN + 1);
+        assert_eq!(sanitize_reason(Some(&huge)), SAFE_REASON_FALLBACK);
+        // Exactly the cap is allowed.
+        let at_cap: String = "a".repeat(SAFE_REASON_MAX_LEN);
+        assert_eq!(sanitize_reason(Some(&at_cap)), at_cap);
+    }
+
+    #[test]
+    fn sanitize_reason_falls_back_when_missing() {
+        assert_eq!(sanitize_reason(None), SAFE_REASON_FALLBACK);
+        assert_eq!(sanitize_reason(Some("")), SAFE_REASON_FALLBACK);
+    }
+
+    #[test]
+    fn validates_signature_accepts_real_signature() {
+        // A real, well-formed Solana signature (base58-encoded 64 bytes).
+        // Generating one without a keypair is fiddly, so we round-trip a
+        // known-good zero signature: `Signature::default()` encodes to a
+        // long base58 string of all-1s.
+        let sig = solana_sdk::signature::Signature::default().to_string();
+        assert!(validates_signature(&sig));
+    }
+
+    #[test]
+    fn validates_signature_rejects_garbage() {
+        assert!(!validates_signature(""));
+        assert!(!validates_signature("not-base58!"));
+        // Right alphabet but wrong length.
+        assert!(!validates_signature("abc"));
+        // Real-looking base58 but only 32 bytes (a Pubkey, not a Signature).
+        let pubkey = solana_sdk::pubkey::Pubkey::default().to_string();
+        assert!(!validates_signature(&pubkey));
+    }
+
+    // ── Integration tests for client message dispatch ─────────────────
+
+    /// Drive the WebSocket route on a random localhost port.
+    ///
+    /// Returns the local socket address and a `JoinHandle` for the server
+    /// task. The caller is expected to abort the handle when finished;
+    /// the server otherwise terminates after 5 seconds via the
+    /// `with_graceful_shutdown` future, matching the existing connected
+    /// smoke test.
+    async fn spawn_test_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let app = Router::new()
+            .route("/ws/plexchat", get(handle_ws_plexchat))
+            .with_state(test_state());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                })
+                .await;
+        });
+        (addr, server)
+    }
+
+    /// Connect to the test server, consume the leading `connected` frame,
+    /// and return the connected client.
+    async fn connect_and_skip_connected(
+        addr: SocketAddr,
+    ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>
+    {
+        let url = format!("ws://{addr}/ws/plexchat");
+        let mut request = url.into_client_request().unwrap();
+        request.headers_mut().insert(
+            "sec-websocket-protocol",
+            HeaderValue::from_static("bearer, test-token"),
+        );
+        let (mut ws, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+
+        // Drop the leading `connected` frame.
+        let frame = tokio::time::timeout(Duration::from_secs(2), ws.next())
+            .await
+            .expect("connected frame timed out")
+            .expect("ws closed before connected")
+            .expect("ws error before connected");
+        let text = match frame {
+            tokio_tungstenite::tungstenite::Message::Text(t) => t,
+            other => panic!("expected text frame, got {other:?}"),
+        };
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["type"], "connected");
+        ws
+    }
+
+    /// Read the next text frame as a JSON value, panicking on timeout.
+    async fn next_json<S>(ws: &mut S) -> serde_json::Value
+    where
+        S: futures_util::Stream<
+                Item = Result<
+                    tokio_tungstenite::tungstenite::Message,
+                    tokio_tungstenite::tungstenite::Error,
+                >,
+            > + Unpin,
+    {
+        let frame = tokio::time::timeout(Duration::from_secs(2), ws.next())
+            .await
+            .expect("ws read timed out")
+            .expect("ws closed prematurely")
+            .expect("ws error");
+        match frame {
+            tokio_tungstenite::tungstenite::Message::Text(t) => serde_json::from_str(&t).unwrap(),
+            other => panic!("expected text frame, got {other:?}"),
         }
+    }
+
+    /// `wallet_connect` → `wallet_connected`, `wallet_disconnect` →
+    /// `wallet_disconnected`. Uses the system program's pubkey
+    /// (all-zeros, base58-encoded as 32 ones) which `Pubkey::from_str`
+    /// always accepts.
+    #[tokio::test]
+    async fn wallet_connect_disconnect_round_trip() {
+        let (addr, server) = spawn_test_server().await;
+        let mut ws = connect_and_skip_connected(addr).await;
+
+        use futures_util::SinkExt;
+
+        // wallet_connect
+        let connect_msg = serde_json::json!({
+            "type": "wallet_connect",
+            "address": "11111111111111111111111111111111",
+        });
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            connect_msg.to_string().into(),
+        ))
+        .await
+        .unwrap();
+        let v = next_json(&mut ws).await;
+        assert_eq!(v["type"], "wallet_connected");
+        assert_eq!(v["address"], "11111111111111111111111111111111");
+
+        // wallet_disconnect
+        let disconnect_msg = serde_json::json!({"type": "wallet_disconnect"});
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            disconnect_msg.to_string().into(),
+        ))
+        .await
+        .unwrap();
+        let v = next_json(&mut ws).await;
+        assert_eq!(v["type"], "wallet_disconnected");
+
+        // Clean shutdown.
+        let _ = ws
+            .send(tokio_tungstenite::tungstenite::Message::Close(None))
+            .await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), async {
+            while ws.next().await.is_some() {}
+        })
+        .await;
+        server.abort();
+        let _ = server.await;
+    }
+
+    /// `wallet_connect` with a malformed address → structured error,
+    /// socket stays open.
+    #[tokio::test]
+    async fn wallet_connect_invalid_address_emits_error() {
+        let (addr, server) = spawn_test_server().await;
+        let mut ws = connect_and_skip_connected(addr).await;
+
+        use futures_util::SinkExt;
+
+        let connect_msg = serde_json::json!({
+            "type": "wallet_connect",
+            "address": "not a real pubkey",
+        });
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            connect_msg.to_string().into(),
+        ))
+        .await
+        .unwrap();
+        let v = next_json(&mut ws).await;
+        assert_eq!(v["type"], "error");
+        assert_eq!(v["code"], "INVALID_WALLET");
+
+        let _ = ws
+            .send(tokio_tungstenite::tungstenite::Message::Close(None))
+            .await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), async {
+            while ws.next().await.is_some() {}
+        })
+        .await;
+        server.abort();
+        let _ = server.await;
+    }
+
+    /// `message` → typing(true) → stub-echo `message` → typing(false).
+    #[tokio::test]
+    async fn message_emits_typing_echo_typing() {
+        let (addr, server) = spawn_test_server().await;
+        let mut ws = connect_and_skip_connected(addr).await;
+
+        use futures_util::SinkExt;
+
+        let msg = serde_json::json!({"type": "message", "content": "hi"});
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            msg.to_string().into(),
+        ))
+        .await
+        .unwrap();
+
+        // typing: true
+        let v = next_json(&mut ws).await;
+        assert_eq!(v["type"], "typing");
+        assert_eq!(v["isTyping"], true);
+
+        // stubbed echo
+        let v = next_json(&mut ws).await;
+        assert_eq!(v["type"], "message");
+        assert_eq!(v["sender"], "Agent");
+        assert_eq!(v["content"], "[stub] echo: hi");
+
+        // typing: false
+        let v = next_json(&mut ws).await;
+        assert_eq!(v["type"], "typing");
+        assert_eq!(v["isTyping"], false);
+
+        let _ = ws
+            .send(tokio_tungstenite::tungstenite::Message::Close(None))
+            .await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), async {
+            while ws.next().await.is_some() {}
+        })
+        .await;
+        server.abort();
+        let _ = server.await;
+    }
+
+    /// Oversize message → MESSAGE_TOO_LONG error frame, socket stays open.
+    #[tokio::test]
+    async fn oversize_message_emits_error() {
+        let (addr, server) = spawn_test_server().await;
+        let mut ws = connect_and_skip_connected(addr).await;
+
+        use futures_util::SinkExt;
+
+        // One byte over the cap.
+        let oversize: String = "a".repeat(MAX_MESSAGE_CONTENT_DEFAULT + 1);
+        let msg = serde_json::json!({"type": "message", "content": oversize});
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            msg.to_string().into(),
+        ))
+        .await
+        .unwrap();
+        let v = next_json(&mut ws).await;
+        assert_eq!(v["type"], "error");
+        assert_eq!(v["code"], "MESSAGE_TOO_LONG");
+
+        let _ = ws
+            .send(tokio_tungstenite::tungstenite::Message::Close(None))
+            .await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), async {
+            while ws.next().await.is_some() {}
+        })
+        .await;
+        server.abort();
+        let _ = server.await;
+    }
+
+    /// `tx_result` for an unknown correlation_id with a malformed signature
+    /// → UNKNOWN_CORRELATION (the late-ok path requires a *well-formed*
+    /// signature; a malformed one exposes a bug in the client).
+    #[tokio::test]
+    async fn tx_result_unknown_correlation_emits_error() {
+        let (addr, server) = spawn_test_server().await;
+        let mut ws = connect_and_skip_connected(addr).await;
+
+        use futures_util::SinkExt;
+
+        let msg = serde_json::json!({
+            "type": "tx_result",
+            "correlationId": "no-such-id",
+            "signature": "garbage!",
+        });
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            msg.to_string().into(),
+        ))
+        .await
+        .unwrap();
+        let v = next_json(&mut ws).await;
+        assert_eq!(v["type"], "error");
+        assert_eq!(v["code"], "UNKNOWN_CORRELATION");
+
+        let _ = ws
+            .send(tokio_tungstenite::tungstenite::Message::Close(None))
+            .await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), async {
+            while ws.next().await.is_some() {}
+        })
+        .await;
+        server.abort();
+        let _ = server.await;
     }
 }
