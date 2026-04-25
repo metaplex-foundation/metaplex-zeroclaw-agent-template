@@ -12,6 +12,7 @@
 //! - [`client`] — thin async RPC wrapper + preflight (SPEC §6.8)
 //! - [`owner`] — on-chain owner resolver + TTL cache (SPEC §3.4)
 
+pub mod auth;
 pub mod client;
 pub mod context;
 pub mod error_codes;
@@ -20,6 +21,7 @@ pub mod owner;
 pub mod state;
 pub mod tool_result;
 
-pub use context::{AgentContext, AgentMode, TxSendError, TxSendOpts, TxSender};
+pub use auth::{AuthLevel, default_auth_policy, with_auth};
+pub use context::{AGENT_CTX, AgentContext, AgentMode, TxSendError, TxSendOpts, TxSender, current_context};
 pub use error_codes::{ToolError, ToolErrorCode, to_tool_error};
 pub use tool_result::{ToolResult, err, info, ok};

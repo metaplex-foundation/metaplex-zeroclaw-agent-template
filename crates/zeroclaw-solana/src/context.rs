@@ -97,6 +97,26 @@ impl std::fmt::Debug for AgentContext {
     }
 }
 
+tokio::task_local! {
+    /// Task-local AgentContext slot. Set by the gateway (or any wrapper) for
+    /// the duration of an agent turn so tools can call `current_context()`.
+    pub static AGENT_CTX: AgentContext;
+}
+
+/// Fetch the current agent context inside a tool body.
+///
+/// Returns a `ToolError` with `ToolErrorCode::Generic` when called outside an
+/// `AGENT_CTX::scope` — tools should propagate this back to the LLM as a
+/// runtime configuration error rather than panic.
+pub fn current_context() -> Result<AgentContext, crate::error_codes::ToolError> {
+    AGENT_CTX
+        .try_with(|c| c.clone())
+        .map_err(|_| crate::error_codes::ToolError {
+            code: crate::error_codes::ToolErrorCode::Generic,
+            message: "no agent context (tool called outside AGENT_CTX::scope)".into(),
+        })
+}
+
 #[cfg(test)]
 mod _assert_send_sync {
     use super::*;
@@ -146,6 +166,35 @@ mod tests {
             TxSendError::Rejected("foo".into()).as_tool_error_code(),
             ToolErrorCode::Generic
         );
+    }
+
+    #[tokio::test]
+    async fn current_context_outside_scope_errors_generic() {
+        let err = current_context().expect_err("must error outside scope");
+        assert_eq!(err.code, ToolErrorCode::Generic);
+        assert!(err.message.contains("AGENT_CTX"));
+    }
+
+    #[tokio::test]
+    async fn current_context_inside_scope_returns_clone() {
+        let ctx = AgentContext {
+            wallet_address: None,
+            agent_mode: AgentMode::Public,
+            agent_asset_address: None,
+            agent_token_mint: None,
+            agent_fee_sol: 0.001,
+            token_override: None,
+            owner_wallet: None,
+            tx_sender: None,
+            solana: Arc::new(crate::client::SolanaClient::new("http://example.invalid")),
+        };
+        AGENT_CTX
+            .scope(ctx.clone(), async move {
+                let got = current_context().unwrap();
+                assert_eq!(got.agent_fee_sol, ctx.agent_fee_sol);
+                assert_eq!(got.agent_mode, ctx.agent_mode);
+            })
+            .await;
     }
 
     #[test]
