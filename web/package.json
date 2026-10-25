@@ -15,7 +15,7 @@
     "react-markdown": "^10.1.0",
     "react-router-dom": "^7.1.1",
     "remark-gfm": "^4.0.1",
-    "smol-toml": "^1.6.1"
+    "smol-toml": "^1.9.0"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.0.0",
